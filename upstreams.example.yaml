@@ -1,0 +1,24 @@
+# Multi-upstream config (Phase 3, ADR 005). Point UPSTREAMS_CONFIG_PATH at a
+# copy of this file to switch the gateway into AGGREGATION mode:
+#
+#   /mcp          one virtual MCP server over every upstream below — merged,
+#                 RBAC-filtered tool catalog; calls routed to the owning server.
+#                 Tool names are namespaced "<name>__<tool>" on the wire and in
+#                 the policy file (see policy.aggregate.example.yaml).
+#   /mcp/<name>   stateless path routing to a single upstream (stage 3a); the
+#                 same namespaced policy applies.
+#
+# With UPSTREAMS_CONFIG_PATH unset, the gateway is the legacy single-upstream
+# proxy via UPSTREAM_MCP_URL — existing deploys are untouched.
+#
+# `name` becomes a URL path segment and a tool-name namespace: lowercase
+# alphanumerics and single hyphens only (never "__"). `url` is the upstream's
+# Streamable HTTP endpoint, reached by compose service DNS in the demo. Each
+# upstream keeps its own service identity in its own container — the gateway
+# config never holds resource credentials (ADR 002).
+
+upstreams:
+  - name: postgres
+    url: http://mcp-upstream:9000/mcp
+  - name: github
+    url: http://github-upstream:9001/mcp

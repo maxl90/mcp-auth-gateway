@@ -1,0 +1,60 @@
+# Phase 0 demo stack — models the "customer network": gateway + MCP server + DB,
+# all on one private compose network. No auth yet (that's Phase 1).
+#
+#   gateway       the product: FastAPI passthrough proxy on :8080 (this repo)
+#   mcp-upstream  crystaldba/postgres-mcp (stdio, --access-mode=unrestricted)
+#                 wrapped by sparfenyuk/mcp-proxy -> Streamable HTTP on :9000
+#   db            official Postgres, seeded once with fake regulated-shaped data
+#
+# Unrestricted upstream is deliberate: the GATEWAY is the enforcement layer, not
+# the server. The gateway reaches the upstream by service name over the compose
+# network. See docs/build/phase-0-scaffold.md.
+
+name: mcp-auth-gateway-demo
+
+services:
+  gateway:
+    build: .                     # the gateway product image (root Dockerfile)
+    # Entra auth config (GATEWAY_ISSUER / _AUDIENCE / _JWKS_URL) comes from
+    # .env.generated, emitted by infra/provision-entra.ps1. UPSTREAM_MCP_URL in
+    # `environment` below overrides the localhost value in that file — inside the
+    # container the upstream is reached by compose service DNS, not localhost.
+    env_file:
+      - .env.generated
+    environment:
+      UPSTREAM_MCP_URL: http://mcp-upstream:9000/mcp   # service-name DNS on the compose network
+      POLICY_PATH: /app/policy.generated.yaml
+    volumes:
+      - ./policy.generated.yaml:/app/policy.generated.yaml:ro   # group->tool RBAC map (gitignored)
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mcp-upstream
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: clinic
+    ports:
+      # Loopback-only: local psql inspection still works, but the demo DB (with
+      # demo/demo creds) is never reachable from other machines on the network.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ./db/seed:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d clinic"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  mcp-upstream:
+    build: ./upstream
+    environment:
+      DATABASE_URI: postgresql://demo:demo@db:5432/clinic
+    ports:
+      - "9000:9000"
+    depends_on:
+      db:
+        condition: service_healthy

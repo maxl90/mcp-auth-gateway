@@ -1,0 +1,60 @@
+# RBAC policy for the GitHub MCP upstream (Phase 2 demo variant).
+#
+# Same shape as policy.example.yaml: Entra group object id -> allowed tool names,
+# matched against the caller's token `groups` claim; union of allow-lists; deny by
+# default (fail closed). Copy to policy.github.generated.yaml with your real group
+# ids (the same analyst/readonly groups provision-entra.ps1 created), and mount it
+# via docker-compose.github.yml.
+#
+# Tool names below target the github-mcp-server toolsets `repos,issues,
+# pull_requests`. CONFIRM them against the live server before relying on them —
+# run the gateway pointed at the GitHub upstream and use demo/list_tools.py (it
+# prints the real, RBAC-filtered tool list). Names drift between server versions.
+
+groups:
+  # Allowed/power role — reads plus writes (open issues, push files, open & merge
+  # PRs). merge/delete are flagged `destructive` below; once Phase 2 step-up lands
+  # they'll require a fresh strong auth before forwarding.
+  "00000000-0000-0000-0000-000000000001": # mcp-analysts (example id)
+    allow:
+      # reads
+      - get_file_contents
+      - search_code
+      - search_repositories
+      - list_issues
+      - issue_read
+      - list_pull_requests
+      - pull_request_read
+      - list_commits
+      - list_branches
+      # writes
+      - issue_write
+      - add_issue_comment
+      - create_branch
+      - create_or_update_file
+      - push_files
+      - create_pull_request
+      - merge_pull_request   # destructive (see below)
+      - delete_file          # destructive (see below)
+
+  # Read-only role — can explore the repo and list issues/PRs, but every write is
+  # denied (403, never forwarded). This is the demo's "denied" user: lists issues
+  # fine, blocked the moment it tries to merge.
+  "00000000-0000-0000-0000-000000000002": # mcp-readonly (example id)
+    allow:
+      - get_file_contents
+      - search_code
+      - search_repositories
+      - list_issues
+      - issue_read
+      - list_pull_requests
+      - pull_request_read
+      - list_commits
+      - list_branches
+
+# Phase 2 step-up hook — high-impact writes that should require a second factor
+# before the gateway forwards them. Parsed today; enforcement arrives with the
+# step-up work (docs/build/phase-2-step-up-design.md).
+destructive:
+  - merge_pull_request
+  - delete_file

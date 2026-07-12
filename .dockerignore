@@ -1,0 +1,11 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+.env.generated
+policy.generated.yaml
+infra/entra-output.json
+uv.lock

@@ -1,0 +1,50 @@
+# On-prem internet-edge overlay (ADR 008 / spec Phase 1). Puts an nginx DMZ
+# proxy in front of the gateway with mTLS at the edge AND a second mTLS hop to
+# the gateway, so nothing but the proxy can even open a gateway connection.
+#
+# Phase 1 (this file) uses the throwaway test PKI from infra/edge/gen-certs.sh
+# and runs auth OFF, to prove the transport chain end-to-end from a clean
+# checkout. Layer it on the QUICKSTART stack:
+#
+#   bash infra/edge/gen-certs.sh
+#   docker compose -f docker-compose.quickstart.yml -f docker-compose.edge.yml up --build
+#
+# Then call THROUGH the edge with a client cert (mTLS) — see the runbook
+# docs/ops/runbooks/edge-exposure.md. Direct :8080 is no longer published;
+# the only way in is 8443 → nginx → gateway.
+#
+# For the governed story (Entra + DPoP + per-call channel audit), swap the
+# quickstart base for docker-compose.yml and set DPOP_MODE / TRUST_EDGE_HEADERS
+# per the config guide — the edge overlay itself is unchanged.
+
+services:
+  gateway:
+    # Serve TLS from the gateway itself and require the proxy's client cert:
+    # the inner hop of the chain. --ssl-cert-reqs 2 = CERT_REQUIRED.
+    command: >
+      uvicorn mcp_auth_gateway.main:app
+      --host 0.0.0.0 --port 8443
+      --ssl-certfile /certs/gateway.pem
+      --ssl-keyfile  /certs/gateway-key.pem
+      --ssl-ca-certs /certs/internal-ca.pem
+      --ssl-cert-reqs 2
+    environment:
+      # Trust the proxy-forwarded client-cert identity headers — safe here
+      # because the gateway is reachable ONLY via the proxy (mTLS listener).
+      TRUST_EDGE_HEADERS: "true"
+    volumes:
+      - ./infra/edge/certs:/certs:ro
+    # Stop publishing 8080 — the edge is the only door now.
+    ports: !reset []
+    expose:
+      - "8443"
+
+  edge:
+    image: nginx:1.27
+    depends_on:
+      - gateway
+    volumes:
+      - ./infra/edge/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/edge/certs:/etc/nginx/certs:ro
+    ports:
+      - "8443:8443"

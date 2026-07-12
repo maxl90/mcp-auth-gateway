@@ -1,0 +1,71 @@
+# RBAC policy for AGGREGATION mode (Phase 3, ADR 005): ONE file spans every
+# upstream — that's the point ("one pane of governance"). Keys are the
+# NAMESPACED tool names the client sees through the aggregated /mcp endpoint:
+# "<upstream>__<tool>", where <upstream> matches upstreams.yaml. The same file
+# governs path-routed requests (/mcp/<name>), which the gateway prefixes
+# before the policy check.
+#
+# Same semantics as policy.example.yaml otherwise: Entra group object id ->
+# allow-list, union across the caller's groups, deny by default (fail closed).
+# Copy to policy.aggregate.generated.yaml with your real group ids and confirm
+# tool names against the live servers (demo/list_tools.py prints the merged,
+# RBAC-filtered catalog — names drift between server versions).
+
+groups:
+  # Analyst — full Postgres analysis set plus GitHub read AND write.
+  "00000000-0000-0000-0000-000000000001": # mcp-analysts (example id)
+    allow:
+      # postgres upstream
+      - postgres__list_schemas
+      - postgres__list_objects
+      - postgres__get_object_details
+      - postgres__explain_query
+      - postgres__analyze_db_health
+      - postgres__analyze_workload_indexes
+      - postgres__analyze_query_indexes
+      - postgres__get_top_queries
+      - postgres__execute_sql
+      # github upstream — reads
+      - github__get_file_contents
+      - github__search_code
+      - github__search_repositories
+      - github__list_issues
+      - github__issue_read
+      - github__list_pull_requests
+      - github__pull_request_read
+      - github__list_commits
+      - github__list_branches
+      # github upstream — writes
+      - github__issue_write
+      - github__add_issue_comment
+      - github__create_branch
+      - github__create_or_update_file
+      - github__push_files
+      - github__create_pull_request
+      - github__merge_pull_request   # destructive (see below)
+      - github__delete_file          # destructive (see below)
+
+  # Read-only — may explore GitHub, sees NOTHING of Postgres. This is the
+  # aggregation demo's money shot: one catalog, filtered per user across
+  # upstreams.
+  "00000000-0000-0000-0000-000000000002": # mcp-readonly (example id)
+    allow:
+      - github__get_file_contents
+      - github__search_code
+      - github__search_repositories
+      - github__list_issues
+      - github__issue_read
+      - github__list_pull_requests
+      - github__pull_request_read
+      - github__list_commits
+      - github__list_branches
+
+# Step-up auth (Phase 2, ADR 006) — enforced. Destructive tools require a fresh
+# Entra authentication context (`acrs` claim) before the gateway forwards; else
+# an RFC 9470 challenge. Namespaced like everything else. List form inherits the
+# STEP_UP_DEFAULT_ACR / STEP_UP_MAX_AGE defaults; use the mapping form for a
+# per-tool require_acr / max_age (see policy.example.yaml).
+destructive:
+  - postgres__execute_sql
+  - github__merge_pull_request
+  - github__delete_file

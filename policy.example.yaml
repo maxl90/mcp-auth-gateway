@@ -1,0 +1,46 @@
+# RBAC policy — Entra group object id -> allowed upstream tool names.
+#
+# Copy to policy.generated.yaml (infra/provision-entra.ps1 emits one with your
+# tenant's real group ids), or point POLICY_PATH at your own file. The group
+# keys are Entra **group object ids** (GUIDs), matched against the caller's
+# token `groups` claim. A caller's allowed set is the union of the allow-lists
+# of every group they belong to; anything not listed is denied (fail closed).
+#
+# Tool names below are the crystaldba/postgres-mcp tool set used in the demo.
+
+groups:
+  # Allowed role — read/analysis tools plus the SQL runner.
+  "00000000-0000-0000-0000-000000000001": # mcp-analysts (example id)
+    allow:
+      - list_schemas
+      - list_objects
+      - get_object_details
+      - explain_query
+      - analyze_db_health
+      - analyze_workload_indexes
+      - analyze_query_indexes
+      - get_top_queries
+      - execute_sql
+
+  # Denied role — no tools. Members authenticate but every tools/call is 403.
+  "00000000-0000-0000-0000-000000000002": # mcp-readonly (example id)
+    allow: []
+
+# Step-up auth (Phase 2, ADR 006) — destructive tools require a fresh, strong
+# auth assertion (an Entra authentication context in the token's `acrs` claim)
+# before the gateway forwards the call; otherwise it returns an RFC 9470
+# challenge and the client re-auths to Entra. Two accepted shapes:
+#
+#   list form  — each tool inherits STEP_UP_DEFAULT_ACR / STEP_UP_MAX_AGE:
+#     destructive:
+#       - execute_sql
+#
+#   mapping form — per-tool override (omit a field to inherit its default):
+#     destructive:
+#       execute_sql:
+#         require_acr: c1     # Entra authentication-context id
+#         max_age: 300        # seconds; how fresh the strong auth must be
+#
+# v1 classifies the WHOLE tool as destructive (no argument-level rules yet).
+destructive:
+  - execute_sql

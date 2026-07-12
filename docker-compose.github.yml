@@ -1,0 +1,57 @@
+# Phase 2 demo variant — GitHub MCP server as a SECOND upstream.
+#
+# Proves upstream-agnostic governance: the SAME gateway image, unchanged, now
+# governs GitHub instead of Postgres. The gateway validates the user's Entra
+# token, applies tool-level RBAC, strips the token, and forwards to the GitHub
+# MCP server — which talks to github.com with its OWN service credential (a PAT),
+# held inside this "customer network". The user token never reaches GitHub; per-
+# user attribution comes from the gateway audit log (see ADR-002).
+#
+# This is a compose OVERLAY, not a replacement. Run it with both files so it
+# merges onto the base stack and re-points the gateway at the GitHub upstream:
+#
+#     docker compose -f docker-compose.yml -f docker-compose.github.yml up -d --build
+#
+# Swap-per-demo (Phase 2): the gateway serves one upstream at a time. The base
+# file points it at Postgres; this overlay re-points it at GitHub. Running BOTH
+# upstreams simultaneously would need multi-upstream path routing in the gateway
+# (deferred — see docs/build/phase-2-tools-list-stepup.md).
+#
+# PREREQUISITE: set GITHUB_PERSONAL_ACCESS_TOKEN in .env (see .env.example) and
+# create policy.github.generated.yaml from policy.github.example.yaml with your
+# real Entra group object ids.
+
+services:
+  # The official GitHub MCP server, run in STDIO mode and wrapped by mcp-proxy
+  # for Streamable HTTP (see upstream-github/Dockerfile). We deliberately do NOT
+  # use the server's own `http` mode: that expects a per-request
+  # Authorization: Bearer <github-token>, which the gateway strips at the trust
+  # boundary — so it would always 401. In stdio mode the env PAT is the service
+  # identity and the gateway forwards with no auth header, exactly like Postgres.
+  github-upstream:
+    build: ./upstream-github
+    environment:
+      # The upstream's service identity for github.com. A classic or fine-grained
+      # PAT, scoped to a throwaway demo repo/org. Provided via .env (gitignored).
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PERSONAL_ACCESS_TOKEN:?set it in .env}
+      # Belt-and-suspenders: keep the upstream itself read-only until you
+      # deliberately demo a blocked write. Flip to 0 to exercise merge/delete.
+      GITHUB_READ_ONLY: ${GITHUB_READ_ONLY:-1}
+      # Narrow the exposed surface to what the demo uses (keeps tools/list small).
+      GITHUB_TOOLSETS: ${GITHUB_TOOLSETS:-repos,issues,pull_requests}
+    ports:
+      # Loopback-only: this is the RAW upstream (no auth) — publishing it beyond
+      # localhost would let LAN callers bypass the gateway entirely.
+      - "127.0.0.1:9001:9001"
+
+  # Re-point the existing gateway service at the GitHub upstream + GitHub policy.
+  # Only the overridden keys change; everything else (Entra config, image) is
+  # inherited from docker-compose.yml.
+  gateway:
+    environment:
+      UPSTREAM_MCP_URL: http://github-upstream:9001/mcp
+      POLICY_PATH: /app/policy.github.generated.yaml
+    volumes:
+      - ./policy.github.generated.yaml:/app/policy.github.generated.yaml:ro
+    depends_on:
+      - github-upstream

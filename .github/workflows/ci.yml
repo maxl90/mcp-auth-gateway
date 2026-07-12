@@ -1,0 +1,37 @@
+name: CI
+
+# Runs the full test suite and linter on every push and PR. No live Entra tenant
+# is needed — token validation is exercised against an in-process RSA key with a
+# monkeypatched JWKS client (see tests/conftest.py), and upstreams are respx-mocked.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Run tests
+        run: uv run pytest -q
