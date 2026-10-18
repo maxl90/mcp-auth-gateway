@@ -1,4 +1,4 @@
-"""Phase 4 audit evidence: tamper-evidence, structural metadata, SIEM export."""
+"""Audit evidence: tamper-evidence, structural metadata, SIEM export."""
 
 from __future__ import annotations
 
@@ -21,7 +21,9 @@ def _reset_chain():
 
 def _write_n(path, n):
     for i in range(n):
-        writer.record(outcome="allowed", tool=f"tool_{i}", correlation_id=f"c{i}")
+        writer.record(
+            writer.AuditEvent(outcome="allowed", tool=f"tool_{i}", correlation_id=f"c{i}")
+        )
 
 
 def test_intact_chain_verifies(tmp_path, monkeypatch):
@@ -73,7 +75,7 @@ def test_chain_survives_restart(tmp_path, monkeypatch):
 
     writer._chain["path"] = None  # simulate a restart
     writer._chain["last_hash"] = None
-    writer.record(outcome="allowed", tool="after_restart", correlation_id="c99")
+    writer.record(writer.AuditEvent(outcome="allowed", tool="after_restart", correlation_id="c99"))
 
     result = verify.verify_file(log)
     assert result.ok and result.records == 4
@@ -143,13 +145,26 @@ def test_export_flattens_attribution_and_structure(tmp_path, monkeypatch):
     log = tmp_path / "audit.log"
     monkeypatch.setattr(writer.settings, "audit_log_path", str(log))
     writer.record(
-        outcome="allowed",
-        tool="postgres__execute_sql",
-        correlation_id="c1",
-        upstream="postgres",
-        claims={"oid": "user-1", "preferred_username": "a@b.com", "tid": "t1", "azp": "agent-1"},
-        structure={"kind": "sql", "tables": ["patients"], "columns": ["mrn"],
-                   "pii_columns": ["mrn"], "touches_pii": True, "statement_types": ["SELECT"]},
+        writer.AuditEvent(
+            outcome="allowed",
+            tool="postgres__execute_sql",
+            correlation_id="c1",
+            upstream="postgres",
+            claims={
+                "oid": "user-1",
+                "preferred_username": "a@b.com",
+                "tid": "t1",
+                "azp": "agent-1",
+            },
+            structure={
+                "kind": "sql",
+                "tables": ["patients"],
+                "columns": ["mrn"],
+                "pii_columns": ["mrn"],
+                "touches_pii": True,
+                "statement_types": ["SELECT"],
+            },
+        )
     )
     rows = [json.loads(line) for line in export.export_lines(log)]
     assert len(rows) == 1

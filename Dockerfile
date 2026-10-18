@@ -1,4 +1,4 @@
-# The gateway product image. (The demo upstream has its own image in upstream/.)
+# The gateway image. The demo upstreams have their own Dockerfiles under deploy/upstreams/.
 #
 # Base image pinned by digest (not mutable tag) for reproducible, supply-chain-
 # safe builds. This is the manifest-list digest for python:3.12-slim.

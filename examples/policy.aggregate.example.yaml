@@ -1,4 +1,4 @@
-# RBAC policy for AGGREGATION mode (Phase 3, ADR 005): ONE file spans every
+# RBAC policy for AGGREGATION mode: ONE file spans every
 # upstream — that's the point ("one pane of governance"). Keys are the
 # NAMESPACED tool names the client sees through the aggregated /mcp endpoint:
 # "<upstream>__<tool>", where <upstream> matches upstreams.yaml. The same file
@@ -45,9 +45,8 @@ groups:
       - github__merge_pull_request   # destructive (see below)
       - github__delete_file          # destructive (see below)
 
-  # Read-only — may explore GitHub, sees NOTHING of Postgres. This is the
-  # aggregation demo's money shot: one catalog, filtered per user across
-  # upstreams.
+  # Read-only — may explore GitHub, sees NOTHING of Postgres: one catalog,
+  # filtered per user across upstreams.
   "00000000-0000-0000-0000-000000000002": # mcp-readonly (example id)
     allow:
       - github__get_file_contents
@@ -60,7 +59,7 @@ groups:
       - github__list_commits
       - github__list_branches
 
-# Step-up auth (Phase 2, ADR 006) — enforced. Destructive tools require a fresh
+# Step-up auth (RFC 9470). Destructive tools require a fresh
 # Entra authentication context (`acrs` claim) before the gateway forwards; else
 # an RFC 9470 challenge. Namespaced like everything else. List form inherits the
 # STEP_UP_DEFAULT_ACR / STEP_UP_MAX_AGE defaults; use the mapping form for a

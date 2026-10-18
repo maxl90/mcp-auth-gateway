@@ -1,4 +1,4 @@
-"""Phase 2 probe — what tools does *this* user see through the gateway?
+"""What tools does *this* user see through the gateway?
 
 Device-code login (reusing the demo client's flow), then a single MCP
 ``tools/list`` through the gateway. The gateway filters the response to the
@@ -35,8 +35,10 @@ async def _list_tools(token: str) -> None:
             for name in names:
                 print("  -", name)
             if not names:
-                print("  (none — this user's groups permit no tools; "
-                      "the list was filtered to empty, not blocked)")
+                print(
+                    "  (none — this user's groups permit no tools; "
+                    "the list was filtered to empty, not blocked)"
+                )
 
 
 def main() -> None:

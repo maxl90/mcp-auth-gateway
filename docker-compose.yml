@@ -1,14 +1,8 @@
-# Phase 0 demo stack — models the "customer network": gateway + MCP server + DB,
-# all on one private compose network. No auth yet (that's Phase 1).
-#
-#   gateway       the product: FastAPI passthrough proxy on :8080 (this repo)
-#   mcp-upstream  crystaldba/postgres-mcp (stdio, --access-mode=unrestricted)
-#                 wrapped by sparfenyuk/mcp-proxy -> Streamable HTTP on :9000
-#   db            official Postgres, seeded once with fake regulated-shaped data
-#
-# Unrestricted upstream is deliberate: the GATEWAY is the enforcement layer, not
-# the server. The gateway reaches the upstream by service name over the compose
-# network. See docs/build/phase-0-scaffold.md.
+# Governed demo stack: the gateway in front of a Postgres MCP server and a seeded
+# Postgres, on one private network. The gateway enforces; the upstream is unrestricted.
+#   docker compose up -d --build
+# Needs .env.generated and policy.generated.yaml, written by infra/provision-entra.ps1
+# against a dev Entra tenant. Without a tenant, use docker-compose.quickstart.yml.
 
 name: mcp-auth-gateway-demo
 
@@ -42,7 +36,7 @@ services:
       # demo/demo creds) is never reachable from other machines on the network.
       - "127.0.0.1:5432:5432"
     volumes:
-      - ./db/seed:/docker-entrypoint-initdb.d:ro
+      - ./deploy/db/seed:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U demo -d clinic"]
       interval: 3s
@@ -50,7 +44,7 @@ services:
       retries: 20
 
   mcp-upstream:
-    build: ./upstream
+    build: ./deploy/upstreams/postgres
     environment:
       DATABASE_URI: postgresql://demo:demo@db:5432/clinic
     ports:

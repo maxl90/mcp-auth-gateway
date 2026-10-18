@@ -2,13 +2,13 @@
 
 The DMZ reverse-proxy layer that exposes the gateway to the internet (ADR 008 /
 the internet-exposure spec). **This is an overlay on the gateway's compose
-stack, not a standalone project** — `docker-compose.edge.yml` (repo root)
+stack, not a standalone project** — `deploy/compose/docker-compose.edge.yml`
 reaches into the gateway service (re-binds its port, mounts certs, injects the
 uvicorn `--ssl-*` flags), so it only works layered:
 
 ```bash
 bash infra/edge/gen-certs.sh
-docker compose -f docker-compose.quickstart.yml -f docker-compose.edge.yml up -d --build
+docker compose -f docker-compose.quickstart.yml -f deploy/compose/docker-compose.edge.yml up -d --build
 uv run python scripts/smoke_edge.py     # should print ALL PASS
 ```
 
@@ -67,7 +67,7 @@ gateway-configuration guide:
 
 ```bash
 bash infra/edge/revoke-cert.sh infra/edge/certs/customer-pilot.pem
-docker compose -f docker-compose.quickstart.yml -f docker-compose.edge.yml exec edge nginx -s reload
+docker compose -f docker-compose.quickstart.yml -f deploy/compose/docker-compose.edge.yml exec edge nginx -s reload
 uv run python scripts/smoke_edge.py --revoked customer-pilot --client-cert customer-pilot
 # the revoked probe passes (cert rejected); the valid-cert probe now fails —
 # re-run gen-certs.sh + restart to reset the test PKI

@@ -1,7 +1,7 @@
 -- Fake, regulated-shaped data for the gateway demo.
--- Theme: a small clinic — PHI/PII columns (SSN, DOB, email, phone, diagnosis,
--- insurance + card data) are exactly what makes the gateway's arg-redaction and
--- "denied destructive SQL" beats land with a healthcare/finance buyer.
+-- Theme: a small clinic. PHI/PII columns (SSN, DOB, email, phone, diagnosis,
+-- insurance + card data) are what the gateway's argument redaction and
+-- "denied destructive SQL" beats are about.
 --
 -- NOTHING HERE IS REAL. SSNs use the 900-999 area range, which the SSA has
 -- never issued, so the data is unmistakably synthetic.

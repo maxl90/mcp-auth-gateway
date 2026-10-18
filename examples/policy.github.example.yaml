@@ -1,10 +1,10 @@
-# RBAC policy for the GitHub MCP upstream (Phase 2 demo variant).
+# RBAC policy for the GitHub MCP upstream.
 #
 # Same shape as policy.example.yaml: Entra group object id -> allowed tool names,
 # matched against the caller's token `groups` claim; union of allow-lists; deny by
 # default (fail closed). Copy to policy.github.generated.yaml with your real group
 # ids (the same analyst/readonly groups provision-entra.ps1 created), and mount it
-# via docker-compose.github.yml.
+# via deploy/compose/docker-compose.github.yml.
 #
 # Tool names below target the github-mcp-server toolsets `repos,issues,
 # pull_requests`. CONFIRM them against the live server before relying on them —
@@ -13,8 +13,8 @@
 
 groups:
   # Allowed/power role — reads plus writes (open issues, push files, open & merge
-  # PRs). merge/delete are flagged `destructive` below; once Phase 2 step-up lands
-  # they'll require a fresh strong auth before forwarding.
+  # PRs). merge/delete are flagged `destructive` below and require a fresh strong
+  # auth before forwarding.
   "00000000-0000-0000-0000-000000000001": # mcp-analysts (example id)
     allow:
       # reads
@@ -52,9 +52,8 @@ groups:
       - list_commits
       - list_branches
 
-# Phase 2 step-up hook — high-impact writes that should require a second factor
-# before the gateway forwards them. Parsed today; enforcement arrives with the
-# step-up work (docs/build/phase-2-step-up-design.md).
+# Step-up: high-impact writes that require a fresh, strong authentication before
+# the gateway forwards them (RFC 9470).
 destructive:
   - merge_pull_request
   - delete_file

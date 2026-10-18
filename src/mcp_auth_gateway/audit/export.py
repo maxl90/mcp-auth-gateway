@@ -1,22 +1,11 @@
 """Export the audit log to SIEM-friendly shapes.
 
-The on-disk record is nested (``actor.agent``, ``arguments.structure``,
-``integrity``) for human/analytic use. Two export shapes are offered:
-
-- **sentinel** (default) — flat PascalCase columns matching Microsoft Sentinel
-  custom-table / DCR conventions. These column names are part of the locked
-  schema contract (see ``docs/architecture/audit-schema.md``) — renaming them
-  breaks downstream KQL.
-- **ocsf** — OCSF *API Activity* (class_uid 6003) events for OCSF-native
-  pipelines (Amazon Security Lake, Splunk/Elastic OCSF ingestion). Gateway
-  evidence with no OCSF attribute (manifest hashes, conformance verdicts,
-  structural metadata, the integrity chain) rides in ``unmapped``, per OCSF
-  convention — nothing is dropped.
-
-CLI (installed as ``mcp-auth-gateway-export-audit``)::
+``sentinel`` (default) flattens a record to PascalCase columns for a Microsoft
+Sentinel custom table; the column names are part of the locked schema, since
+renaming them breaks downstream KQL. ``ocsf`` emits OCSF API Activity (class
+6003) events; gateway evidence with no OCSF attribute rides in ``unmapped``.
 
     mcp-auth-gateway-export-audit [in_path] [out_path] [--format sentinel|ocsf]
-    # in_path defaults to AUDIT_LOG_PATH; out_path defaults to stdout
 """
 
 from __future__ import annotations
@@ -27,11 +16,11 @@ from datetime import datetime
 from pathlib import Path
 
 from ..config import settings
+from .log import iter_records
 
 
 def _join(values: object) -> str | None:
-    """Join a list of identifiers into a comma-separated string (Sentinel columns
-    are scalar-friendly); pass through None."""
+    """Comma-join a list of identifiers (Sentinel columns are scalar); ``None`` otherwise."""
     if isinstance(values, list):
         return ",".join(str(v) for v in values)
     return None
@@ -55,7 +44,7 @@ def flatten_record(rec: dict) -> dict:
         "SchemaVersion": rec.get("schema_version"),
         "CorrelationId": rec.get("correlation_id"),
         "TenantId": rec.get("tenant_id"),
-        # Attribution — the whole point: agent vs. the human it acted for.
+        # Attribution: the agent and the human it acted for.
         "AgentAppId": agent.get("app_id"),
         "AgentName": agent.get("name"),
         "OnBehalfOfOid": human.get("oid"),
@@ -118,13 +107,11 @@ def _epoch_ms(ts: object) -> int | None:
 
 
 def flatten_record_ocsf(rec: dict) -> dict:
-    """Map a nested audit record to an OCSF *API Activity* event.
+    """Map a record to an OCSF API Activity event.
 
-    An MCP ``tools/call`` has no CRUD semantics OCSF can name, so
-    ``activity_id`` is Other(99) with the tool in ``api.operation``. The
-    attribution split maps cleanly: the agent is the OCSF ``actor`` app, the
-    human is ``actor.user``. Everything OCSF has no attribute for is carried
-    verbatim under ``unmapped`` — the evidence survives the format.
+    A ``tools/call`` has no CRUD semantics OCSF can name, so ``activity_id`` is Other
+    (99) with the tool in ``api.operation``; the agent is the OCSF ``actor`` app and
+    the human is ``actor.user``. Everything else is carried under ``unmapped``.
     """
     actor = rec.get("actor") or {}
     agent = actor.get("agent") or {}
@@ -158,7 +145,7 @@ def flatten_record_ocsf(rec: dict) -> dict:
         "metadata": {
             "version": "1.1.0",  # OCSF schema version targeted
             "correlation_uid": rec.get("correlation_id"),
-            "product": {"name": "mcp-auth-gateway", "vendor_name": "AIIG"},
+            "product": {"name": "mcp-auth-gateway", "vendor_name": "mcp-auth-gateway"},
         },
         "unmapped": {
             "schema_version": rec.get("schema_version"),
@@ -180,17 +167,7 @@ _FORMATS = {"sentinel": flatten_record, "ocsf": flatten_record_ocsf}
 def export_lines(in_path: str | Path, fmt: str = "sentinel"):
     """Yield flattened JSON-Line strings for each record in the log."""
     mapper = _FORMATS[fmt]
-    p = Path(in_path)
-    if not p.exists():
-        return
-    for raw in p.read_text(encoding="utf-8").splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            rec = json.loads(raw)
-        except ValueError:
-            continue  # skip a corrupt line rather than abort the export
+    for _, rec in iter_records(in_path):  # a corrupt line is skipped, not fatal
         yield json.dumps(mapper(rec), separators=(",", ":"), ensure_ascii=False)
 
 

@@ -1,6 +1,6 @@
-"""Phase 2 step-up round-trip spike — the "destructive call → MFA → proceeds" beat.
+"""Step-up round trip: the "destructive call → MFA → proceeds" beat.
 
-Demonstrates the full RFC 9470 loop (ADR 006) end to end:
+Demonstrates the full RFC 9470 loop end to end:
 
   1. Call a *destructive* tool with an ordinary token.
   2. The gateway answers 401 `insufficient_user_authentication` with an
@@ -19,7 +19,7 @@ Uses a raw httpx POST (not the MCP SDK) so the 401 challenge and its
 
   uv run --extra demo python demo/step_up_demo.py
 
-PREREQUISITE (deferred — gate 3): an Entra authentication context (e.g. `c1`)
+PREREQUISITE: an Entra authentication context (e.g. `c1`)
 bound to a Conditional Access policy in the tenant. Until that exists this
 prints the challenge and the re-auth attempt, but Entra won't mint the `acrs`
 claim, so step 4 will re-challenge rather than succeed. The gateway half is
@@ -73,16 +73,20 @@ def main() -> None:
     print(f"    WWW-Authenticate: {resp.headers.get('www-authenticate')}")
 
     if resp.status_code != 401:
-        print("    (Expected a 401 step-up challenge. Is the tool marked destructive "
-              "in the policy? Did the token already carry the context?)")
+        print(
+            "    (Expected a 401 step-up challenge. Is the tool marked destructive "
+            "in the policy? Did the token already carry the context?)"
+        )
         return
 
     challenge = _parse_challenge(resp)
     if not challenge:
         print("    Could not parse the step-up challenge; aborting.")
         return
-    print(f"\n[2] Gateway demanded step-up: acr={challenge['acr']} "
-          f"max_age={challenge['max_age']}s — call was NOT forwarded.")
+    print(
+        f"\n[2] Gateway demanded step-up: acr={challenge['acr']} "
+        f"max_age={challenge['max_age']}s — call was NOT forwarded."
+    )
 
     print("\n[3] Re-authenticating to Entra for that authentication context ...")
     stepped = client._login(claims_challenge=client.build_claims_challenge(challenge["acr"]))
@@ -95,8 +99,10 @@ def main() -> None:
     if retry.status_code == 200:
         print("    ✅ Forwarded — step-up satisfied; the gateway let it through.")
     else:
-        print("    ⛔ Still challenged. Expected until the Entra auth context + "
-              "Conditional Access policy exist in the tenant (gate 3).")
+        print(
+            "    ⛔ Still challenged. Expected until the Entra auth context + "
+            "Conditional Access policy exist in the tenant."
+        )
 
 
 if __name__ == "__main__":

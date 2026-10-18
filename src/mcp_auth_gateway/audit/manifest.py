@@ -1,30 +1,11 @@
-"""Tool-manifest hash pinning + drift evidence (backlog item 10).
+"""Tool-manifest pinning and drift evidence.
 
-A poisoned tool description or a rug-pull (an upstream silently changing what a
-tool claims to do) is a *forensics* problem: "what did the tool definition say
-at the moment the agent acted?" To answer it, the gateway pins a SHA-256 of
-each tool's trust-relevant manifest fields (``name`` + ``description`` +
-``inputSchema``) the first time it observes the tool, persists the baseline to
-a file (ADR 004: state in files, never a database), and on every later
-observation:
-
-- **unchanged** → nothing;
-- **changed** → a first-class ``manifest_drift`` audit record carrying the old
-  and new hashes, and the baseline advances to the new manifest.
-
-Every ``tools/call`` audit record is stamped with the pinned manifest hash
-(``manifest.sha256``) so the log attests which tool definition was current when
-the call transited. **Detection and attestation only — there is deliberately no
-blocking path** (ADR 007: enforcement is platform territory; a drift event is
-evidence, not a gate).
-
-The baseline file stores tool *metadata* only (names, descriptions, schemas) —
-never tokens, arguments, or customer data — so it sits inside the trust
-boundary trivially. First observation of a tool adopts it silently as baseline:
-the gateway cannot attest to what an upstream served before the gateway existed.
-
-When signed tool manifests land in the MCP spec (extension #2913), signature
-verification results become one more field on this same record shape.
+A poisoned tool description, or an upstream quietly changing what a tool claims
+to do, is a forensics question: what did the definition say when the agent acted?
+The gateway pins a SHA-256 of each tool's ``name`` + ``description`` +
+``inputSchema`` the first time it sees the tool (it cannot attest to anything
+earlier), persists the baseline to a file of tool metadata only, and on a later
+change writes a ``manifest_drift`` record with both hashes. Evidence, never a gate.
 """
 
 from __future__ import annotations
@@ -35,22 +16,19 @@ import sys
 from pathlib import Path
 
 from ..config import settings
-from ..upstreams import namespace_tool
+from ..naming import namespace_tool
 from . import writer as audit
 
 # Baseline file format version — the file is a cache/pin store, not the locked
 # audit schema; bump freely if the shape must change (old files just re-pin).
 BASELINE_VERSION = "1"
-_BASELINE_VERSION = BASELINE_VERSION  # deprecated alias, kept for back-compat
 
 
 def manifest_hash(tool: dict) -> str:
-    """Deterministic SHA-256 over the trust-relevant manifest fields.
+    """SHA-256 over the trust-relevant fields: ``name``, ``description``, ``inputSchema``.
 
-    Only ``name``/``description``/``inputSchema`` participate: they are what an
-    agent reasons over. Cosmetic catalog fields (``title``, annotations) can
-    churn without a drift event. Canonical JSON (sorted keys) makes the hash
-    reproducible across processes and restarts.
+    Cosmetic catalog fields (``title``, annotations) can change without a drift
+    event. Canonical JSON (sorted keys) keeps the hash stable across processes.
     """
     content = {
         "name": tool.get("name"),
@@ -67,8 +45,7 @@ _store: dict = {"path": None, "tools": {}}
 
 
 def _load(path: Path) -> dict[str, dict]:
-    """Read the baseline file; any problem yields an empty baseline (tools
-    re-pin on next observation) rather than a crash."""
+    """The baseline file's tools, or ``{}`` for a missing or unreadable file (tools re-pin)."""
     if not path.exists():
         return {}
     try:
@@ -80,9 +57,7 @@ def _load(path: Path) -> dict[str, dict]:
 
 
 def _save(path: Path, tools: dict[str, dict]) -> None:
-    """Persist the baseline. A sink failure must never drop the request —
-    log to stderr and carry on with the in-memory baseline (same posture as
-    the audit writer's file sink)."""
+    """Persist the baseline; a sink failure is logged to stderr and never fails the request."""
     try:
         path.write_text(
             json.dumps({"version": BASELINE_VERSION, "tools": tools}, sort_keys=True),
@@ -111,13 +86,11 @@ def observe_catalog(
     correlation_id: str,
     claims: dict | None = None,
 ) -> None:
-    """Pin/compare every tool in an observed ``tools/list`` catalog.
+    """Pin or compare every tool in an observed ``tools/list`` catalog.
 
-    ``upstream`` namespaces the pin keys (aggregation/path-routed modes) so the
-    keys match the wire/policy names the audit records use; ``None`` keys by the
-    bare tool name (legacy single-upstream mode). A changed manifest emits a
-    ``manifest_drift`` audit record attributed to the caller whose request
-    surfaced the change.
+    ``upstream`` namespaces the keys to match the wire and policy names; ``None``
+    keys by the bare tool name. A changed manifest writes a ``manifest_drift``
+    record attributed to the caller whose request surfaced it.
     """
     path = Path(settings.manifest_baseline_path)
     baseline = _tools(path)
@@ -132,13 +105,15 @@ def observe_catalog(
             continue
         if entry is not None:
             audit.record(
-                outcome="manifest_drift",
-                tool=wire,
-                correlation_id=correlation_id,
-                claims=claims,
-                reason="tool manifest changed since the pinned baseline",
-                upstream=upstream,
-                manifest={"sha256": digest, "previous_sha256": entry.get("sha256")},
+                audit.AuditEvent(
+                    outcome="manifest_drift",
+                    tool=wire,
+                    correlation_id=correlation_id,
+                    claims=claims,
+                    reason="tool manifest changed since the pinned baseline",
+                    upstream=upstream,
+                    manifest={"sha256": digest, "previous_sha256": entry.get("sha256")},
+                )
             )
         baseline[wire] = {"sha256": digest, "inputSchema": tool.get("inputSchema")}
         changed = True

@@ -1,7 +1,7 @@
-"""Authentication and authorization for the gateway.
+"""Who the caller is, and what they may call.
 
-``token_validator`` proves *who* the caller is (Entra ID token → claims).
-``policy_resolver`` decides *what* they may call (group claim → allowed tools).
-The proxy path in ``main`` wires both together; neither module forwards the
-user's token upstream — the gateway terminates it (see CONTEXT.md trust boundary).
+``token_validator`` turns an Entra ID token into claims; ``policy_resolver``
+maps the groups claim to allowed tools; ``step_up`` and ``dpop`` add the
+freshness and key-binding checks; ``enforce`` runs them in order for every
+``/mcp`` request. The token is validated here and never forwarded.
 """

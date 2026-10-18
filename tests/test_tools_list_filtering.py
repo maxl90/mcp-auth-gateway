@@ -1,4 +1,4 @@
-"""Phase 2: ``tools/list`` response filtering.
+"""``tools/list`` response filtering.
 
 Two layers:
 - pure-function unit tests over ``tools_filter`` (JSON + SSE framing, edge cases),
@@ -13,16 +13,16 @@ import json
 import httpx
 import pytest
 import respx
-from fastapi.testclient import TestClient
 
 from mcp_auth_gateway import main
 from mcp_auth_gateway.auth.policy_resolver import Policy
 from mcp_auth_gateway.tools_filter import (
+    extract_tools,
     filter_tools_list_response,
     is_tools_list_request,
 )
 
-from .conftest import ANALYST_GROUP, DENIED_GROUP, ISSUER, RESOURCE_URL
+from .conftest import ANALYST_GROUP, DENIED_GROUP
 
 # The nine tools the demo's postgres-mcp upstream actually advertises.
 ALL_TOOLS = [
@@ -187,24 +187,15 @@ def test_sse_non_json_frame_left_intact():
 
 
 @pytest.fixture
-def client(validator, monkeypatch, tmp_path):
-    monkeypatch.setattr(main, "get_validator", lambda: validator)
-    monkeypatch.setattr(main, "get_policy", lambda: _POLICY)
-    monkeypatch.setattr(main.settings, "auth_enabled", True)
-    monkeypatch.setattr(main.settings, "upstream_mcp_url", UPSTREAM)
-    monkeypatch.setattr(main.settings, "gateway_resource_url", RESOURCE_URL)
-    monkeypatch.setattr(main.settings, "gateway_issuer", ISSUER)
-    monkeypatch.setattr(main.settings, "gateway_external_base_url", "")
-    monkeypatch.setattr(main.audit.settings, "audit_log_path", str(tmp_path / "audit.log"))
-    with TestClient(main.app) as c:
-        yield c
+def policy() -> Policy:
+    return _POLICY
 
 
 def _tools_list_request() -> bytes:
     return json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).encode()
 
 
-def test_proxy_filters_tools_list_for_analyst(client, make_token):
+def test_proxy_filters_tools_list_for_analyst(legacy_client, make_token):
     token = make_token(groups=[ANALYST_GROUP])
     upstream_body = json.dumps(_tools_list_result(ALL_TOOLS))
     with respx.mock:
@@ -213,7 +204,7 @@ def test_proxy_filters_tools_list_for_analyst(client, make_token):
                 200, content=upstream_body, headers={"content-type": "application/json"}
             )
         )
-        resp = client.post(
+        resp = legacy_client.post(
             "/mcp",
             content=_tools_list_request(),
             headers={"Authorization": f"Bearer {token}"},
@@ -222,7 +213,7 @@ def test_proxy_filters_tools_list_for_analyst(client, make_token):
     assert _names_in(resp.content) == ANALYST_ALLOWED
 
 
-def test_proxy_filters_tools_list_to_empty_for_denied_user(client, make_token):
+def test_proxy_filters_tools_list_to_empty_for_denied_user(legacy_client, make_token):
     token = make_token(groups=[DENIED_GROUP])
     upstream_body = json.dumps(_tools_list_result(ALL_TOOLS))
     with respx.mock:
@@ -231,7 +222,7 @@ def test_proxy_filters_tools_list_to_empty_for_denied_user(client, make_token):
                 200, content=upstream_body, headers={"content-type": "application/json"}
             )
         )
-        resp = client.post(
+        resp = legacy_client.post(
             "/mcp",
             content=_tools_list_request(),
             headers={"Authorization": f"Bearer {token}"},
@@ -241,7 +232,7 @@ def test_proxy_filters_tools_list_to_empty_for_denied_user(client, make_token):
     assert _names_in(resp.content) == []
 
 
-def test_proxy_tools_list_still_reaches_upstream(client, make_token):
+def test_proxy_tools_list_still_reaches_upstream(legacy_client, make_token):
     """Filtering is a response rewrite, not a block — the request is forwarded."""
     token = make_token(groups=[ANALYST_GROUP])
     with respx.mock:
@@ -252,7 +243,7 @@ def test_proxy_tools_list_still_reaches_upstream(client, make_token):
                 headers={"content-type": "application/json"},
             )
         )
-        client.post(
+        legacy_client.post(
             "/mcp",
             content=_tools_list_request(),
             headers={"Authorization": f"Bearer {token}"},
@@ -262,8 +253,8 @@ def test_proxy_tools_list_still_reaches_upstream(client, make_token):
     assert "authorization" not in {k.lower() for k in route.calls.last.request.headers}
 
 
-def test_proxy_does_not_filter_when_auth_disabled(client, make_token, monkeypatch):
-    """Phase 0 passthrough: no identity to filter by, so the full list passes."""
+def test_proxy_does_not_filter_when_auth_disabled(legacy_client, make_token, monkeypatch):
+    """Auth off: no identity to filter by, so the full list passes."""
     monkeypatch.setattr(main.settings, "auth_enabled", False)
     with respx.mock:
         respx.post(UPSTREAM).mock(
@@ -273,5 +264,53 @@ def test_proxy_does_not_filter_when_auth_disabled(client, make_token, monkeypatc
                 headers={"content-type": "application/json"},
             )
         )
-        resp = client.post("/mcp", content=_tools_list_request())
+        resp = legacy_client.post("/mcp", content=_tools_list_request())
     assert _names_in(resp.content) == ALL_TOOLS
+
+
+def test_filter_drops_non_string_tool_name_and_still_filters():
+    allowed = {"safe_tool"}
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [
+                    {"name": "safe_tool"},
+                    {"name": "secret_tool"},  # not allowed → must be removed
+                    {"name": ["crafted"]},  # unhashable → must not blow the filter open
+                ]
+            },
+        }
+    ).encode()
+    out = json.loads(filter_tools_list_response(body, "application/json", allowed))
+    names = [t.get("name") for t in out["result"]["tools"]]
+    # The crafted entry did NOT cause a fail-open: secret_tool is still gone.
+    assert names == ["safe_tool"]
+
+
+def test_oversized_tools_list_is_refused_not_buffered(gateway_client, policy, make_token):
+    """The single-upstream filter buffers the response to rewrite it; past the cap
+    it answers 502 instead of holding a multi-GB body in memory."""
+    token = make_token(groups=[ANALYST_GROUP])
+    huge = json.dumps(_tools_list_result(["x" * 10000]))
+    with gateway_client("single", policy, max_upstream_response_bytes=512) as c, respx.mock:
+        respx.post(UPSTREAM).mock(
+            return_value=httpx.Response(
+                200, content=huge, headers={"content-type": "application/json"}
+            )
+        )
+        resp = c.post(
+            "/mcp", content=_tools_list_request(), headers={"Authorization": f"Bearer {token}"}
+        )
+    assert resp.status_code == 502
+    assert resp.json()["error"] == "upstream_response_too_large"
+
+
+def test_unrecognized_content_type_passes_through_unchanged():
+    """Filtering is visibility only: a body the filter cannot classify is returned as
+    received (tools/call RBAC still denies anything it would have hidden)."""
+    raw = json.dumps(_tools_list_result(["secret_tool"])).encode()
+    assert filter_tools_list_response(raw, "text/plain", {"other"}) == raw
+    assert filter_tools_list_response(raw, None, {"other"}) == raw
+    assert extract_tools(raw, "text/plain") == []

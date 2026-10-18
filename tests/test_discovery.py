@@ -1,6 +1,6 @@
 """Protected Resource Metadata + discovery — the MCP auth handshake anchor.
 
-Phase 1.5 (RFC 9728): a cold client discovers how to authenticate against the
+RFC 9728: a cold client discovers how to authenticate against the
 gateway via the PRM document and the 401 ``resource_metadata`` pointer.
 """
 
@@ -18,7 +18,7 @@ from .conftest import ISSUER, RESOURCE_URL
 @pytest.fixture
 def configured(monkeypatch):
     """Resource-server settings configured, auth off so the PRM route can be
-    exercised without standing up the validator/policy (REQ-1.5.3)."""
+    exercised without standing up the validator/policy."""
     monkeypatch.setattr(main.settings, "auth_enabled", False)
     monkeypatch.setattr(main.settings, "gateway_resource_url", RESOURCE_URL)
     monkeypatch.setattr(main.settings, "gateway_issuer", ISSUER)

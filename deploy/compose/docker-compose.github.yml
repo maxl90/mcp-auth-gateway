@@ -1,35 +1,19 @@
-# Phase 2 demo variant — GitHub MCP server as a SECOND upstream.
-#
-# Proves upstream-agnostic governance: the SAME gateway image, unchanged, now
-# governs GitHub instead of Postgres. The gateway validates the user's Entra
-# token, applies tool-level RBAC, strips the token, and forwards to the GitHub
-# MCP server — which talks to github.com with its OWN service credential (a PAT),
-# held inside this "customer network". The user token never reaches GitHub; per-
-# user attribution comes from the gateway audit log (see ADR-002).
-#
-# This is a compose OVERLAY, not a replacement. Run it with both files so it
-# merges onto the base stack and re-points the gateway at the GitHub upstream:
-#
-#     docker compose -f docker-compose.yml -f docker-compose.github.yml up -d --build
-#
-# Swap-per-demo (Phase 2): the gateway serves one upstream at a time. The base
-# file points it at Postgres; this overlay re-points it at GitHub. Running BOTH
-# upstreams simultaneously would need multi-upstream path routing in the gateway
-# (deferred — see docs/build/phase-2-tools-list-stepup.md).
-#
-# PREREQUISITE: set GITHUB_PERSONAL_ACCESS_TOKEN in .env (see .env.example) and
-# create policy.github.generated.yaml from policy.github.example.yaml with your
-# real Entra group object ids.
+# Overlay: the GitHub MCP server as the upstream instead of Postgres. Same gateway
+# image; the server holds its own PAT and the user's token never reaches GitHub.
+#   docker compose -f docker-compose.yml -f deploy/compose/docker-compose.github.yml up -d --build
+# Needs GITHUB_PERSONAL_ACCESS_TOKEN in .env (see .env.example) and
+# policy.github.generated.yaml at the repo root, copied from examples/ with real group ids.
+# Run from the repo root: relative paths resolve against the first -f file.
 
 services:
   # The official GitHub MCP server, run in STDIO mode and wrapped by mcp-proxy
-  # for Streamable HTTP (see upstream-github/Dockerfile). We deliberately do NOT
+  # for Streamable HTTP (see deploy/upstreams/github/Dockerfile). We deliberately do NOT
   # use the server's own `http` mode: that expects a per-request
   # Authorization: Bearer <github-token>, which the gateway strips at the trust
   # boundary — so it would always 401. In stdio mode the env PAT is the service
   # identity and the gateway forwards with no auth header, exactly like Postgres.
   github-upstream:
-    build: ./upstream-github
+    build: ./deploy/upstreams/github
     environment:
       # The upstream's service identity for github.com. A classic or fine-grained
       # PAT, scoped to a throwaway demo repo/org. Provided via .env (gitignored).

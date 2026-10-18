@@ -1,10 +1,10 @@
-"""Smoke-test the internet edge (ADR 008): the mTLS chain must admit a valid
+"""Smoke-test the internet edge: the mTLS chain must admit a valid
 client cert end-to-end and reject everything else.
 
 Run against a live edge stack:
 
     bash infra/edge/gen-certs.sh
-    docker compose -f docker-compose.quickstart.yml -f docker-compose.edge.yml up -d --build
+    docker compose -f docker-compose.quickstart.yml -f deploy/compose/docker-compose.edge.yml up -d --build
     uv run python scripts/smoke_edge.py
 
 Probes (exit 0 only if ALL hold):
@@ -54,9 +54,14 @@ def probe_valid(url: str, certs: Path, cert_name: str) -> str | None:
                 url,
                 headers=HEADERS,
                 json={
-                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                    "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                               "clientInfo": {"name": "smoke-edge", "version": "0"}},
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "smoke-edge", "version": "0"},
+                    },
                 },
             )
             if init.status_code != 200:
@@ -89,26 +94,40 @@ def probe_rejected(url: str, certs: Path, cert_name: str | None) -> str | None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Smoke-test the mTLS edge (ADR 008)")
+    ap = argparse.ArgumentParser(description="Smoke-test the mTLS edge")
     ap.add_argument("--url", default="https://localhost:8443/mcp")
     ap.add_argument("--certs", default="infra/edge/certs", type=Path)
-    ap.add_argument("--client-cert", default="customer-pilot",
-                    help="cert name (without .pem) for the valid-cert probe")
-    ap.add_argument("--revoked", default=None, metavar="NAME",
-                    help="also assert this cert name is rejected (CRL drill)")
+    ap.add_argument(
+        "--client-cert",
+        default="customer-pilot",
+        help="cert name (without .pem) for the valid-cert probe",
+    )
+    ap.add_argument(
+        "--revoked",
+        default=None,
+        metavar="NAME",
+        help="also assert this cert name is rejected (CRL drill)",
+    )
     args = ap.parse_args()
 
     checks: list[tuple[str, str | None]] = [
-        ("valid client cert -> full MCP handshake",
-         probe_valid(args.url, args.certs, args.client_cert)),
-        ("no client cert -> rejected",
-         probe_rejected(args.url, args.certs, None)),
-        ("wrong-CA cert (proxy-client) -> rejected",
-         probe_rejected(args.url, args.certs, "proxy-client")),
+        (
+            "valid client cert -> full MCP handshake",
+            probe_valid(args.url, args.certs, args.client_cert),
+        ),
+        ("no client cert -> rejected", probe_rejected(args.url, args.certs, None)),
+        (
+            "wrong-CA cert (proxy-client) -> rejected",
+            probe_rejected(args.url, args.certs, "proxy-client"),
+        ),
     ]
     if args.revoked:
-        checks.append((f"revoked cert ({args.revoked}) -> rejected",
-                       probe_rejected(args.url, args.certs, args.revoked)))
+        checks.append(
+            (
+                f"revoked cert ({args.revoked}) -> rejected",
+                probe_rejected(args.url, args.certs, args.revoked),
+            )
+        )
 
     failed = 0
     for name, failure in checks:

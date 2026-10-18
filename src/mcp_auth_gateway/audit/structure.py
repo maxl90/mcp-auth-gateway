@@ -1,18 +1,14 @@
 """Value-free structural metadata about tool-call arguments.
 
-Turns "arguments were redacted" from an empty claim into positive evidence:
-*which* tables and columns a SQL call touched, whether a PII-shaped column was
-involved, or — for any other tool — which argument *keys* were present. Never
-the values.
+Positive evidence that redaction happened: which tables and columns a SQL call
+touched, whether a PII-shaped column was involved, or, for any other tool, which
+argument keys were present. Never the values. A parse failure degrades to a
+coarse descriptor, never to the raw input.
 
 **Invariant:** nothing returned here may contain an argument *value*. Only
 identifiers that come from the query/tool *shape* (table names, column names,
 argument keys, statement type) are emitted. A SQL literal like ``'123-45-6789'``
 is a value and must never appear. This is asserted adversarially in the tests.
-
-Best-effort: on any parse failure it returns a coarse descriptor (never the raw
-input), so a malformed or exotic query degrades to less evidence, never to a
-leak and never to a crash.
 """
 
 from __future__ import annotations
@@ -22,25 +18,36 @@ from typing import Any
 import sqlglot
 from sqlglot import expressions as exp
 
+from ..naming import split_namespaced
+
 # Column-name substrings that suggest regulated/PII data. Heuristic and
 # deliberately conservative — this is an evidence signal ("a PII-shaped column
 # was referenced"), not an enforcement decision. Matched case-insensitively
 # against column identifiers only (never values).
 _PII_HINTS = frozenset(
     {
-        "ssn", "social_security", "mrn", "dob", "date_of_birth", "birth",
-        "diagnosis", "patient", "first_name", "last_name", "email", "phone",
-        "address", "salary", "account_number", "routing", "card", "passport",
-        "national_id", "tax_id",
+        "ssn",
+        "social_security",
+        "mrn",
+        "dob",
+        "date_of_birth",
+        "birth",
+        "diagnosis",
+        "patient",
+        "first_name",
+        "last_name",
+        "email",
+        "phone",
+        "address",
+        "salary",
+        "account_number",
+        "routing",
+        "card",
+        "passport",
+        "national_id",
+        "tax_id",
     }
 )
-
-
-def _base_tool(name: str) -> str:
-    """The upstream's own tool name, stripped of any ``upstream__`` namespace
-    prefix (aggregation mode). Splits on the FIRST separator — upstream names
-    never contain ``__`` — so a tool whose own name contains ``__`` survives."""
-    return name.split("__", 1)[1] if "__" in name else name
 
 
 def _looks_pii(column: str) -> bool:
@@ -49,8 +56,7 @@ def _looks_pii(column: str) -> bool:
 
 
 def _describe_sql(sql: Any) -> dict:
-    """Structural description of a SQL string — tables, columns, statement type,
-    and whether any referenced column looks like PII. Never returns SQL text."""
+    """Tables, columns, statement types and PII-shaped columns of a SQL string; never the SQL."""
     if not isinstance(sql, str):
         return {"kind": "sql", "sql_present": bool(sql)}
     try:
@@ -84,17 +90,17 @@ def _describe_sql(sql: Any) -> dict:
 
 
 def describe(tool: str, arguments: Any) -> dict | None:
-    """Return value-free structural metadata for a ``tools/call``.
+    """Value-free structural metadata for a ``tools/call``, or ``None`` without arguments.
 
-    - A SQL-running tool (base name ``execute_sql``) → table/column/PII shape.
-    - Any other tool → just the sorted top-level argument **keys** (names the
-      tool's schema defines — not data).
-    Returns ``None`` when there are no arguments to describe.
+    A SQL-running tool (base name ``execute_sql``) yields table/column/PII shape; any
+    other tool yields its sorted top-level argument keys.
     """
     if arguments is None:
         return None
 
-    if _base_tool(tool) == "execute_sql":
+    namespaced = split_namespaced(tool)
+    base_tool = namespaced[1] if namespaced else tool
+    if base_tool == "execute_sql":
         sql = arguments.get("sql") if isinstance(arguments, dict) else None
         return _describe_sql(sql)
 

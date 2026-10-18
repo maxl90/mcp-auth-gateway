@@ -1,4 +1,4 @@
-"""Backlog items 10 + 11: tool-manifest pinning/drift and schema-conformance
+"""Tool-manifest pinning/drift and schema-conformance
 telemetry. Both are evidence-only — nothing here blocks or rejects a call —
 and both must uphold the value-free invariant (no argument value may ever
 appear in an audit record), asserted adversarially below.
@@ -11,14 +11,12 @@ import json
 import httpx
 import pytest
 import respx
-from fastapi.testclient import TestClient
 
-from mcp_auth_gateway import main
 from mcp_auth_gateway.audit import conformance, manifest, writer
 from mcp_auth_gateway.auth.policy_resolver import Policy
 from mcp_auth_gateway.tools_filter import extract_tools
 
-from .conftest import ANALYST_GROUP, ISSUER, RESOURCE_URL
+from .conftest import ANALYST_GROUP
 
 UPSTREAM = "http://localhost:9000/mcp"
 
@@ -224,19 +222,11 @@ _POLICY = Policy(groups={ANALYST_GROUP: ["list_schemas", "execute_sql"]}, destru
 
 
 @pytest.fixture
-def client(validator, monkeypatch, tmp_path):
-    monkeypatch.setattr(main, "get_validator", lambda: validator)
-    monkeypatch.setattr(main, "get_policy", lambda: _POLICY)
-    monkeypatch.setattr(main.settings, "auth_enabled", True)
-    monkeypatch.setattr(main.settings, "upstream_mcp_url", UPSTREAM)
-    monkeypatch.setattr(main.settings, "gateway_resource_url", RESOURCE_URL)
-    monkeypatch.setattr(main.settings, "gateway_issuer", ISSUER)
-    monkeypatch.setattr(main.settings, "gateway_external_base_url", "")
-    with TestClient(main.app) as c:
-        yield c
+def policy() -> Policy:
+    return _POLICY
 
 
-def test_call_records_carry_manifest_and_conformance(client, make_token, tmp_path):
+def test_call_records_carry_manifest_and_conformance(legacy_client, make_token, tmp_path):
     """The full evidence loop: a served tools/list pins the manifest; the next
     tools/call audit record attests which definition the agent saw AND whether
     the arguments honored its schema — with no value leakage."""
@@ -247,7 +237,10 @@ def test_call_records_carry_manifest_and_conformance(client, make_token, tmp_pat
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": {"name": "execute_sql", "arguments": {"sql": "SELECT 1", "made_up": "SECRET-ARG"}},
+            "params": {
+                "name": "execute_sql",
+                "arguments": {"sql": "SELECT 1", "made_up": "SECRET-ARG"},
+            },
         }
     ).encode()
 
@@ -259,12 +252,18 @@ def test_call_records_carry_manifest_and_conformance(client, make_token, tmp_pat
                 headers={"content-type": "application/json"},
             )
         )
-        assert client.post(
-            "/mcp", content=list_body, headers={"Authorization": f"Bearer {token}"}
-        ).status_code == 200
-        assert client.post(
-            "/mcp", content=call_body, headers={"Authorization": f"Bearer {token}"}
-        ).status_code == 200
+        assert (
+            legacy_client.post(
+                "/mcp", content=list_body, headers={"Authorization": f"Bearer {token}"}
+            ).status_code
+            == 200
+        )
+        assert (
+            legacy_client.post(
+                "/mcp", content=call_body, headers={"Authorization": f"Bearer {token}"}
+            ).status_code
+            == 200
+        )
 
     records = _audit_records(tmp_path)
     call_recs = [r for r in records if r["outcome"] == "allowed"]

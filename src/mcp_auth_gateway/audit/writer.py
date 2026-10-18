@@ -1,22 +1,11 @@
-"""Audit record construction, integrity chaining, and sinks.
+"""Audit record construction, hash chaining, and the local sinks.
 
-A record captures *who* — distinguishing the **acting agent** (the app/agent
-identity) from the **human principal** it acted on behalf of (the attribution
-problem: agents run under user credentials, so naive logs blame the human) —
-*what* tool, on *which* upstream, *when*, the *outcome*, and a *correlation id*.
-It records **structural** metadata about the arguments (which tables/columns a
-query touched, argument keys) but **never the argument values**: redaction is
-default and there is no flag to disable it.
-
-Each record is **hash-chained** to the previous one (``integrity.prev_hash`` /
-``integrity.record_hash``): deleting or editing any past record breaks the chain
-and is detectable by ``audit.verify`` — tamper-evident, GRC-grade evidence. The
-chain assumes a single writer process (the gateway is single-process async);
-multi-replica aggregation would chain per-replica.
-
-The schema is **locked** (``SCHEMA_VERSION``, currently 1.2) for stable SIEM
-ingestion — renaming or removing fields post-launch forces early adopters to
-rewrite queries; 1.x changes are strictly additive.
+A record names the acting agent and the human it acted on behalf of, the tool,
+the upstream, the outcome, and a correlation id. It carries structural metadata
+about the arguments but never their values; there is no switch for that. Each
+record is hash-chained to the previous one, so an edit or deletion is detectable
+by ``audit.verify``. The schema is locked at ``SCHEMA_VERSION``: 1.x changes are
+additive only, because SIEM queries depend on the field names.
 """
 
 from __future__ import annotations
@@ -24,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -31,21 +21,18 @@ from typing import Literal
 from ..config import settings
 
 # Bump only on a breaking field change; additive fields keep 1.x.
-# 1.1 (additive): `manifest` (tool-definition hash pinning + drift) and
+# 1.1 added `manifest` (tool-definition hash pinning + drift) and
 #   `arguments.conformance` (inputSchema conformance telemetry).
-# 1.2 (additive): `channel` — transport-layer identity: the edge proxy's
-#   client-cert serial/DN (mTLS network identity) and the DPoP key thumbprint
-#   (token binding). Network identity + token identity = the two-factor audit
-#   trail (ADR 008).
+# 1.2 added `channel`: the edge proxy's client-cert serial/DN and the DPoP key
+#   thumbprint, so a record carries network identity and token identity.
 SCHEMA_VERSION = "1.2"
 
-# allowed / denied — Phase 1 authz outcomes.
-# degraded — Phase 3: an upstream was unavailable while serving an aggregated
-#   request (partial catalog); this record keeps that from being silent.
-# step_up_required — Phase 2 (ADR 006): a destructive call was RBAC-permitted but
-#   lacked a fresh, strong auth assertion — challenged, not forwarded.
-# manifest_drift — backlog item 10: an observed tool manifest differs from the
-#   pinned baseline (possible rug-pull/poisoning). Evidence only, never a gate.
+# degraded: an upstream was unavailable while serving an aggregated request, so
+#   the catalog was partial; the record keeps that from being silent.
+# step_up_required: a destructive call was permitted by RBAC but lacked a fresh,
+#   strong authentication; it was challenged, not forwarded.
+# manifest_drift: an observed tool manifest differs from the pinned baseline
+#   (possible rug-pull or poisoning). Evidence only, never a gate.
 Outcome = Literal["allowed", "denied", "degraded", "step_up_required", "manifest_drift"]
 
 
@@ -54,18 +41,8 @@ def _now_iso() -> str:
 
 
 def _actor(claims: dict | None) -> dict:
-    """Split the token's identity into the acting **agent** and the **human**
-    it acted on behalf of — the attribution problem, made explicit.
-
-    - Agent (the app/client making the call): Entra puts the client id in ``azp``
-      (v2) or ``appid`` (v1); an optional display name in ``app_displayname``.
-    - Human principal: ``oid`` (stable per user/tenant), ``preferred_username`` /
-      ``upn``, and ``sub`` (pairwise per-app).
-
-    Either side may be absent: an app-only token (no user) yields
-    ``on_behalf_of: null``; a token with no client claim yields ``agent: null``.
-    ``idtyp`` (``app`` | ``user``) disambiguates when present.
-    """
+    """The acting agent (``azp``/``appid``) and the human it acted for (``oid``, username, ``sub``);
+    either may be ``None``, and an app-only token (``idtyp: app``) has no human."""
     if not claims:
         return {"agent": None, "on_behalf_of": None}
 
@@ -88,43 +65,50 @@ def _actor(claims: dict | None) -> dict:
     return {"agent": agent, "on_behalf_of": on_behalf_of}
 
 
-def build_record(
-    *,
-    outcome: Outcome,
-    tool: str | None,
-    correlation_id: str,
-    claims: dict | None = None,
-    reason: str | None = None,
-    upstream: str | None = None,
-    structure: dict | None = None,
-    manifest: dict | None = None,
-    conformance: dict | None = None,
-    channel: dict | None = None,
-) -> dict:
+@dataclass(frozen=True)
+class AuditEvent:
+    """What one audit record attests.
+
+    ``structure``, ``manifest``, ``conformance`` and ``channel`` are the
+    value-free evidence stamps; argument values are never part of an event.
+    """
+
+    outcome: Outcome
+    tool: str | None
+    correlation_id: str
+    claims: dict | None = None
+    reason: str | None = None
+    upstream: str | None = None
+    structure: dict | None = None
+    manifest: dict | None = None
+    conformance: dict | None = None
+    channel: dict | None = None
+
+
+def build_record(event: AuditEvent) -> dict:
     """Build the audit record **content** (everything except the integrity
     chain, which ``write`` adds). Argument *values* are intentionally absent —
     only ``structure`` and ``conformance`` (both value-free) are carried."""
     return {
         "schema_version": SCHEMA_VERSION,
         "ts": _now_iso(),
-        "correlation_id": correlation_id,
-        "tenant_id": (claims or {}).get("tid"),
-        "actor": _actor(claims),
+        "correlation_id": event.correlation_id,
+        "tenant_id": (event.claims or {}).get("tid"),
+        "actor": _actor(event.claims),
         # Transport-layer identity (v1.2): edge mTLS cert serial/DN + DPoP key
         # thumbprint, when present. None on records with no channel evidence.
-        "channel": channel,
-        "tool": tool,
-        "upstream": upstream,
-        "outcome": outcome,
-        "reason": reason,
+        "channel": event.channel,
+        "tool": event.tool,
+        "upstream": event.upstream,
+        "outcome": event.outcome,
+        "reason": event.reason,
         # Pinned tool-definition hash: {"sha256"} on tool calls (what the agent
         # saw); + {"previous_sha256"} on manifest_drift records. None elsewhere.
-        "manifest": manifest,
+        "manifest": event.manifest,
         "arguments": {
-            "redacted": True,  # explicit: raw values are never recorded
-            "structure": structure,  # value-free metadata (tables/columns/keys) or None
-            # inputSchema conformance verdict (value-free violations) or None.
-            "conformance": conformance,
+            "redacted": True,
+            "structure": event.structure,
+            "conformance": event.conformance,
         },
     }
 
@@ -132,7 +116,6 @@ def build_record(
 # --- integrity chain -------------------------------------------------------
 
 GENESIS = "0" * 64  # prev_hash of the first record in a chain
-_GENESIS = GENESIS  # deprecated alias, kept for back-compat
 
 
 def compute_hash(content: dict, prev_hash: str | None) -> str:
@@ -151,9 +134,8 @@ _chain: dict[str, str | None] = {"path": None, "last_hash": None}
 
 
 def _seed_last_hash(path: Path) -> str | None:
-    """On first write to a path, continue the existing chain by reading the last
-    record's ``record_hash`` from the log tail (so a restart doesn't fork the
-    chain). Missing/empty/corrupt tail → genesis (``None``)."""
+    """The last record's hash, so a restart continues the chain rather than forking it;
+    ``None`` (genesis) when the log is missing, empty, or its tail is corrupt."""
     if not path.exists():
         return None
     try:
@@ -202,31 +184,6 @@ def write(content: dict) -> dict:
     return chained
 
 
-def record(
-    *,
-    outcome: Outcome,
-    tool: str | None,
-    correlation_id: str,
-    claims: dict | None = None,
-    reason: str | None = None,
-    upstream: str | None = None,
-    structure: dict | None = None,
-    manifest: dict | None = None,
-    conformance: dict | None = None,
-    channel: dict | None = None,
-) -> dict:
+def record(event: AuditEvent) -> dict:
     """Build and write in one call; returns the chained record."""
-    return write(
-        build_record(
-            outcome=outcome,
-            tool=tool,
-            correlation_id=correlation_id,
-            claims=claims,
-            reason=reason,
-            upstream=upstream,
-            structure=structure,
-            manifest=manifest,
-            conformance=conformance,
-            channel=channel,
-        )
-    )
+    return write(build_record(event))

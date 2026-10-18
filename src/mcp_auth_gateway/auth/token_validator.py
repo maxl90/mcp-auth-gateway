@@ -1,12 +1,9 @@
-"""Entra ID token validation.
+"""Entra ID access-token validation.
 
-Validates the caller's OAuth 2.1 access token against the tenant's JWKS
-endpoint and returns its claims. The token is verified *locally* — the gateway
-fetches Entra's public signing keys and checks the signature, issuer, audience,
-and expiry itself. The token is never sent anywhere (the trust boundary).
-
-Phase 1.5 hardens the audience/issuer rules further (RFC 8707/9207); this module
-already does the core RS256-family JWKS validation those build on.
+The token is verified locally against the tenant's JWKS: signature, issuer,
+audience and expiry. It is never sent anywhere else. A key-resolution miss
+forces one throttled JWKS refresh, so a rotated signing key is picked up at
+once without letting bogus ``kid`` floods turn into a fetch storm.
 """
 
 from __future__ import annotations
@@ -27,6 +24,10 @@ logger = logging.getLogger("mcp_auth_gateway.auth")
 # allowlist — the standard JWT downgrade/confused-key defense.
 _ALLOWED_ALGORITHMS = ["RS256", "RS384", "RS512"]
 
+# Client-facing: it flows into the WWW-Authenticate challenge, so it names nothing
+# internal. Raw exception text goes to the server log only.
+_KEY_RESOLUTION_ERROR = "unable to resolve token signing key"
+
 
 class TokenError(Exception):
     """Token failed validation. Carries the OAuth ``error`` code + description
@@ -39,17 +40,11 @@ class TokenError(Exception):
 
 
 class TokenValidator:
-    """Wraps a cached ``PyJWKClient``. One instance per process — ``PyJWKClient``
-    caches the fetched JWK set (``lifespan`` seconds), so only the first
-    validation in each window hits Entra.
+    """One per process, around a cached ``PyJWKClient``.
 
-    **Key rotation:** Entra rotates signing keys periodically. Within the cache
-    lifespan a token signed by a freshly-rotated key would fail resolution
-    ("no matching key") until the cache expires. To pick up a rotation
-    immediately, a resolution miss triggers **one throttled forced refresh** of
-    the JWK set and a retry. The refresh is rate-limited
-    (``jwks_refresh_min_interval``) so a flood of tokens with bogus ``kid`` values
-    can't turn this into a JWKS-fetch amplification/DoS.
+    Within the cache lifespan a token signed by a freshly rotated key would fail to
+    resolve, so a miss triggers one forced refresh and a retry, rate-limited by
+    ``jwks_refresh_min_interval``.
     """
 
     def __init__(
@@ -67,16 +62,10 @@ class TokenValidator:
                 "GATEWAY_AUDIENCE to be set (see .env.generated from provisioning)."
             )
         self._jwk_client = self._new_client()
-        # -inf, not 0.0: time.monotonic() counts from host boot, so with 0.0 a
-        # freshly booted host (uptime < jwks_refresh_min_interval) would wrongly
-        # throttle the FIRST rotation refresh. -inf guarantees the first forced
-        # refresh is always allowed.
+        # -inf so the first forced refresh is never throttled on a freshly booted host.
         self._last_refresh = float("-inf")
 
     def _new_client(self) -> PyJWKClient:
-        # cache_jwk_set + lifespan: hold the fetched set briefly to avoid a
-        # per-request round trip to Entra; a rotation mid-lifespan is handled by
-        # the forced refresh in validate().
         return PyJWKClient(
             self._jwks_url,
             cache_jwk_set=True,
@@ -84,8 +73,7 @@ class TokenValidator:
         )
 
     def _refresh_jwks(self) -> bool:
-        """Force a fresh JWKS fetch by dropping the cache — but no more often than
-        ``jwks_refresh_min_interval`` seconds. Returns True if it refreshed."""
+        """Drop the cached JWK set, at most once per ``jwks_refresh_min_interval``."""
         now = time.monotonic()
         if now - self._last_refresh < settings.jwks_refresh_min_interval:
             return False
@@ -95,27 +83,22 @@ class TokenValidator:
 
     def validate(self, token: str) -> dict:
         """Return the verified claims, or raise :class:`TokenError`."""
-        # The description below flows into the client-facing WWW-Authenticate
-        # challenge, so it stays generic — raw exception text (which can name
-        # the JWKS URL or internal network errors) goes to the server log only.
-        _KEY_ERROR = "unable to resolve token signing key"
         try:
             signing_key = self._jwk_client.get_signing_key_from_jwt(token)
         except PyJWKClientError as exc:
-            # Possibly a rotated key not yet in our cached set — force one
-            # throttled refresh and retry before giving up.
+            # Possibly a rotated key not yet cached: one throttled refresh, then retry.
             if self._refresh_jwks():
                 try:
                     signing_key = self._jwk_client.get_signing_key_from_jwt(token)
                 except Exception as exc2:  # noqa: BLE001 — any failure → invalid_token
                     logger.warning("signing key resolution failed after refresh: %s", exc2)
-                    raise TokenError(_KEY_ERROR) from exc2
+                    raise TokenError(_KEY_RESOLUTION_ERROR) from exc2
             else:
                 logger.warning("signing key resolution failed (refresh throttled): %s", exc)
-                raise TokenError(_KEY_ERROR) from exc
+                raise TokenError(_KEY_RESOLUTION_ERROR) from exc
         except Exception as exc:  # network, malformed token, etc.
             logger.warning("signing key resolution failed: %s", exc)
-            raise TokenError(_KEY_ERROR) from exc
+            raise TokenError(_KEY_RESOLUTION_ERROR) from exc
 
         try:
             claims = jwt.decode(
@@ -142,8 +125,7 @@ _validator: TokenValidator | None = None
 
 
 def get_validator() -> TokenValidator:
-    """Lazily build the process-wide validator (defers the JWKS-config check
-    until auth is actually needed, so Phase 0 passthrough still imports clean)."""
+    """The process-wide validator, built on first use so auth-off runs never need JWKS config."""
     global _validator
     if _validator is None:
         _validator = TokenValidator()

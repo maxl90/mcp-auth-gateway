@@ -1,176 +1,152 @@
 # mcp-auth-gateway
 
-A governed reverse proxy for MCP servers: put **enterprise identity in front of
-your MCP tools**, and get **attributed, tamper-evident audit evidence** of what
-your agents did — **without your data leaving the network**.
+An OAuth 2.1 reverse proxy for MCP servers: validates Entra ID tokens, enforces
+tool-level RBAC, and writes a hash-chained, argument-free audit log.
 
-The gateway runs inside your network, in front of one or more MCP servers. It
-validates every caller's OAuth 2.1 token locally, maps their identity to the
-tools they may use, forwards only authorized calls, and records a structured
-evidence trail of every invocation. **User tokens and raw tool-call arguments
-never leave your network** — only the upstream MCP server and your own audit
-sink ever see them. There is no SaaS in the request path.
+```
+client (agent)                  mcp-auth-gateway                            upstream MCP server(s)
+--------------                  ----------------                            ----------------------
+POST /mcp ------------------->  1. validate the token against the IdP's JWKS
+Authorization: Bearer <jwt>     2. tools/call? RBAC, then step-up, then DPoP
+                                3. write the audit record (no argument values)
+                                4. strip Authorization, forward ---------->  the server reaches its
+                                                                             resource with its OWN
+          <-------------------  5. tools/list answers filtered <----------  credential
+                                   to the caller's permitted tools
+```
 
----
+The token is validated at the gateway and never forwarded; each upstream reaches
+its resource with its own service identity. The audit record carries who (the
+agent and the human it acted for), which tool, which tables or columns a query
+touched, and the outcome, but never the argument values.
 
-## The trust boundary
+## Quickstart
 
-This is the whole design. The user's `Authorization` token is validated *at the
-gateway* against your IdP's JWKS endpoint and then **stripped** — it is never
-forwarded upstream. Each upstream MCP server reaches its resource (a database,
-GitHub, etc.) with its **own service identity**. Per-user attribution comes from
-the audit log, not from a propagated credential.
-
-The audit records carry *who / which agent / on whose behalf / what tool / what
-it touched / when / outcome* — but **never the argument values**. A neutral
-evidence layer is more credible precisely because it demonstrably cannot see the
-underlying data, which is what lets regulated teams (FedRAMP / HIPAA / PCI) adopt
-it without a procurement fight.
-
----
-
-## What it does (all live)
-
-- **Validates Entra ID OAuth 2.1 tokens** locally against the tenant JWKS
-  endpoint — signature, issuer, audience, expiry (RS256/384/512 only; `none`/HMAC
-  rejected). No valid token, no entry (`401`). Handles JWKS **key rotation**
-  (throttled refresh-on-miss).
-- **Terminates the token at the gateway** — validated, then stripped; never
-  forwarded upstream.
-- **Tool-level RBAC** — maps Entra group memberships to an allowed tool set via a
-  human-editable `policy.yaml`. A disallowed `tools/call` is `403`, never
-  forwarded.
-- **`tools/list` filtering** — callers only *see* the tools they can invoke
-  (content-type aware: JSON and SSE).
-- **Step-up auth on destructive tools** (RFC 9470) — high-impact tools require a
-  fresh, stronger authentication (an Entra authentication context in the token);
-  otherwise the call is challenged on both an HTTP `WWW-Authenticate` header and a
-  JSON-RPC error, and is not forwarded.
-- **DPoP sender-constrained tokens** (RFC 9449) — when the authorization server
-  binds a token to a client key pair (`cnf.jkt`), the gateway demands a valid
-  proof-of-possession on every request, so a stolen token is useless without the
-  private key. `DPOP_MODE` is `off` / `if_present` (default: enforce binding the
-  moment the AS provides it) / `required`. See
-  `src/mcp_auth_gateway/auth/dpop.py`.
-- **On-prem mTLS internet edge** — an nginx DMZ reverse-proxy overlay
-  (`docker-compose.edge.yml` + `infra/edge/`) that hard-fails mTLS at the edge
-  and makes a second mTLS hop to the gateway, so only the proxy can open a
-  gateway connection. Includes CRL-based client-cert revocation
-  (`infra/edge/revoke-cert.sh`) and cert-expiry monitoring
-  (`infra/edge/check-cert-expiry.sh`). The edge client-cert identity and DPoP
-  key thumbprint land in each audit record's `channel` block.
-- **Multi-upstream aggregation** — front many MCP servers as **one virtual MCP
-  server**: a merged, RBAC-filtered, namespaced (`upstream__tool`) catalog, with
-  each call routed to its owning upstream. Partial-failure tolerant; sessions
-  reconnect transparently on upstream expiry.
-- **Evidence-grade audit** — every invocation produces a structured record that:
-  - **attributes** the acting **agent** (the app/agent identity) distinctly from
-    the **human** it acted on behalf of (the attribution problem: agents run
-    under user credentials, so naive logs blame the human);
-  - carries **value-free structural metadata** — which tables/columns a SQL call
-    touched and whether a PII-shaped column was involved, or the argument keys of
-    any other tool — **never the values**;
-  - is **hash-chained** and therefore **tamper-evident**.
-- **OAuth 2.1 resource-server discovery** — Protected Resource Metadata at
-  `/.well-known/oauth-protected-resource` and `resource_metadata` challenge
-  pointers (RFC 8707/9207/9728).
-
-The audit record schema is locked at v1.2 (attribution, structural arguments,
-integrity chain, SIEM export columns). Changes within 1.x are strictly
-additive: v1.1 added tool-manifest drift detection and inputSchema conformance
-telemetry; v1.2 added the `channel` block (edge mTLS client-cert identity +
-DPoP key thumbprint).
-
----
-
-## Quickstart — see it run in one command (no identity provider)
-
-Requires Docker. This brings up the gateway + a sample MCP server + a seeded
-Postgres with **auth turned off**, so you can watch the proxy work with zero
-setup:
+Requires Docker. One command brings up the gateway, a sample MCP server, and a
+seeded Postgres with authentication turned off:
 
 ```sh
 docker compose -f docker-compose.quickstart.yml up --build
 ```
 
-Then, in another shell, do the MCP handshake and call a tool (no token needed in
-this mode):
+In another shell, do the MCP handshake (no token needed in this mode):
 
 ```sh
-# initialize -> you get an Mcp-Session-Id back
 curl -s -i -X POST http://localhost:8080/mcp \
   -H 'content-type: application/json' \
   -H 'accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
 ```
 
-> **This is the "does it run?" on-ramp, not the governed mode.**
-> `AUTH_ENABLED=false` makes the gateway a plain pass-through — no identity, no
-> RBAC. For the real story (identity, RBAC, evidence), use the governed demo
-> below.
+What you just saw is pass-through mode: `AUTH_ENABLED=false`, no identity, no
+RBAC. The governed mode below is the gateway as intended.
 
----
+## Governed mode
 
-## The governed demo (Entra ID)
-
-Requires Docker, [`uv`](https://docs.astral.sh/uv/), and a **dev** Entra tenant.
+Requires Docker, [`uv`](https://docs.astral.sh/uv/), and a development Entra tenant.
 
 ```sh
-# 1. Provision a dev/personal tenant (one time): creates an app, two security
-#    groups, two test users. Writes .env.generated (tenant/client/issuer/audience/
-#    jwks) and policy.generated.yaml (group -> allowed tools).
+# 1. Provision a dev tenant once: an app, two security groups, two test users.
+#    Writes .env.generated (issuer, audience, JWKS) and policy.generated.yaml.
 pwsh infra/provision-entra.ps1
 
 # 2. Bring up the governed stack: gateway :8080 -> mcp-upstream :9000 -> Postgres.
 docker compose up -d --build
 
-# 3. Call a tool as the *allowed* (analyst) user — device-code login, then a
-#    real SELECT against PII-shaped data succeeds:
+# 3. Call a tool as the allowed (analyst) user: device-code login, then a SELECT.
 uv run --extra demo python demo/client.py
 
-# 4. Run again as the *denied* (readonly) user — the same call is 403, and the
-#    request never reaches the database:
+# 4. The same call as the denied (readonly) user is 403 and never reaches the database.
 GATEWAY_LOGIN_HINT=<readonly-upn> uv run --extra demo python demo/client.py
 
-# 5. See the evidence — structured, attributed, redacted audit lines:
+# 5. The evidence: structured, attributed, redacted audit lines.
 docker compose logs gateway
 ```
 
-An unauthenticated request is refused before it goes anywhere, and points a cold
+An unauthenticated request is refused before it goes anywhere and points a cold
 client at discovery:
 
 ```sh
 curl -i -X POST http://localhost:8080/mcp -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute_sql"}}'
-# -> 401; WWW-Authenticate: Bearer realm="mcp", resource_metadata="…/.well-known/oauth-protected-resource"
+# -> 401; WWW-Authenticate: Bearer realm="mcp", resource_metadata=".../.well-known/oauth-protected-resource"
 ```
 
----
+## Features
 
-## Multiple upstreams: one governed front door
+| Feature | Standard | Settings | Code |
+|---|---|---|---|
+| Token validation against the tenant JWKS (RS256/384/512 only, key rotation), then termination: the token is never forwarded | OAuth 2.1 | `GATEWAY_ISSUER`, `GATEWAY_AUDIENCE`, `GATEWAY_JWKS_URL` | `auth/token_validator.py`, `proxy.py` |
+| Protected Resource Metadata and the `resource_metadata` pointer on every 401 | RFC 9728, 8707, 9207 | `GATEWAY_RESOURCE_URL`, `GATEWAY_EXTERNAL_BASE_URL` | `auth/discovery.py` |
+| Tool-level RBAC: Entra groups to allowed tools; a disallowed `tools/call` is 403 and not forwarded | | `POLICY_PATH` | `auth/policy_resolver.py`, `auth/enforce.py` |
+| `tools/list` filtered to the caller's tools (JSON and SSE bodies) | | `POLICY_PATH` | `tools_filter.py` |
+| Step-up: destructive tools need a fresh Entra authentication context or get a challenge | RFC 9470 | `STEP_UP_DEFAULT_ACR`, `STEP_UP_MAX_AGE` | `auth/step_up.py` |
+| DPoP: a key-bound token must prove possession on every request | RFC 9449 | `DPOP_MODE`, `DPOP_IAT_WINDOW` | `auth/dpop.py` |
+| Aggregation: many MCP servers behind one `/mcp` with a merged, namespaced (`upstream__tool`) catalog and per-call routing | | `UPSTREAMS_CONFIG_PATH` | `aggregator/` |
+| Audit log: hash-chained records with the agent/human split, value-free argument structure, tool-manifest drift, and schema conformance | | `AUDIT_LOG_PATH`, `MANIFEST_BASELINE_PATH` | `audit/` |
+| Evidence CLIs: chain verification, Sentinel and OCSF export, framework reports, signed attestation packs | OCSF 1.1 | | `audit/verify.py`, `audit/export.py`, `evidence/` |
+| mTLS edge overlay: an nginx DMZ proxy with a second mTLS hop to the gateway; the client-cert identity lands in the audit `channel` block | | `TRUST_EDGE_HEADERS`, `GATEWAY_TLS_*` | `deploy/compose/docker-compose.edge.yml`, `infra/edge/` |
 
-The same gateway governs *any* MCP server. Point it at more than one and it
-becomes a single virtual MCP server over all of them — one merged, per-user
-catalog, each call routed to its owner, one identity/RBAC/audit pass.
+## Configuration
+
+Settings come from environment variables or a `.env` file; each env var is the
+field name in upper case.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `UPSTREAM_MCP_URL` | `http://localhost:9000/mcp` | The upstream MCP server's Streamable HTTP endpoint in single-upstream mode. |
+| `UPSTREAMS_CONFIG_PATH` | empty | Path to an `upstreams.yaml`; setting it switches to aggregation mode. |
+| `MAX_UPSTREAM_RESPONSE_BYTES` | `10485760` | Cap on any upstream response the gateway buffers (the `tools/list` filter and aggregator RPCs); streaming passthrough is unaffected. `0` disables it. |
+| `FORWARD_ATTRIBUTION_HEADERS` | `false` | In aggregation mode, send `X-MCP-Gateway-Correlation-Id` and `X-MCP-Gateway-On-Behalf-Of` with each `tools/call`. Audit metadata only; a backend must never authorize on them. |
+| `GATEWAY_HOST`, `GATEWAY_PORT` | `0.0.0.0`, `8080` | Where the gateway listens. |
+| `AUTH_ENABLED` | `true` | **Warning:** `false` forwards every request unauthenticated. The quickstart's pass-through mode. |
+| `GATEWAY_ISSUER` | empty | Entra issuer, `https://login.microsoftonline.com/<tenant>/v2.0`. Required when auth is on. |
+| `GATEWAY_AUDIENCE` | empty | Expected `aud`: the app (client) id for v2 access tokens. Required when auth is on. |
+| `GATEWAY_JWKS_URL` | empty | The tenant's signing keys, `https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys`. Required when auth is on. |
+| `JWKS_CACHE_LIFESPAN` | `300` | Seconds the fetched key set is cached. |
+| `JWKS_REFRESH_MIN_INTERVAL` | `60` | A key-resolution miss forces one refresh and retry, but no more often than this, so bogus `kid` floods cannot become a JWKS fetch storm. |
+| `GATEWAY_RESOURCE_URL` | empty | Canonical resource identifier in Protected Resource Metadata (Entra: `api://<client-id>`). Required when auth is on; the gateway refuses to start without it. |
+| `GATEWAY_EXTERNAL_BASE_URL` | empty | Public `scheme://host[:port]` for the `resource_metadata` pointer behind a reverse proxy, also accepted as a DPoP `htu` base. Empty derives it from the request. |
+| `SCOPES_SUPPORTED` | `["access_as_user"]` | Scopes advertised in the PRM document (a JSON list in the environment). |
+| `ENTRA_AUTH_SERVER_METADATA_URL` | empty | Issuer identifier published in PRM `authorization_servers`; empty falls back to `GATEWAY_ISSUER`. |
+| `POLICY_PATH` | `policy.generated.yaml` | Group-id to allowed-tools map; `examples/policy.example.yaml` documents the shape. |
+| `AUDIT_LOG_PATH` | `audit.log` | Append-only JSONL audit log; records also go to stdout. |
+| `MANIFEST_BASELINE_PATH` | `manifest-baseline.json` | Pinned per-tool SHA-256 of `name` + `description` + `inputSchema`, persisted so drift survives a restart. Tool metadata only. |
+| `STEP_UP_DEFAULT_ACR` | `c1` | Entra authentication-context id a destructive tool requires in `acrs`, unless the policy names its own `require_acr`. The strength behind it is a Conditional Access policy in Entra. |
+| `STEP_UP_MAX_AGE` | `300` | Seconds since `auth_time` within which that authentication counts as fresh. |
+| `DPOP_MODE` | `if_present` | `off` ignores proofs; `if_present` requires a valid proof for any token carrying `cnf.jkt` and lets unbound tokens work as bearer tokens; `required` also rejects tokens without `cnf.jkt`. |
+| `DPOP_IAT_WINDOW` | `300` | Acceptance window for a proof's `iat`, seconds both ways; the `jti` replay cache keeps entries for twice this. |
+| `TRUST_EDGE_HEADERS` | `false` | **Warning:** enable only when nothing but the edge proxy can reach the gateway. Records the proxy's `X-Client-Cert-Serial` / `X-Client-Cert-DN` in the audit `channel` block; a directly reachable gateway would let callers spoof edge identity. |
+| `GATEWAY_TLS_CERTFILE`, `GATEWAY_TLS_KEYFILE` | empty | Serve TLS from the gateway itself (the inner hop of the edge pattern). Applies to the `mcp-auth-gateway` console script; the container image's default command runs uvicorn directly, so the edge overlay passes `--ssl-*` flags instead. |
+| `GATEWAY_TLS_CA_CERTS`, `GATEWAY_TLS_REQUIRE_CLIENT_CERT` | empty, `false` | With `require_client_cert`, only holders of a certificate from this CA (the edge proxy) can open a connection. |
+
+## Run modes
+
+**Single upstream.** `UPSTREAM_MCP_URL` names one MCP server and `/mcp` proxies
+to it: every request is authenticated, a `tools/call` is authorized, a
+`tools/list` answer is filtered, everything else streams through.
+`docker compose up -d --build` is this mode with the Postgres upstream.
+
+**Path-routed.** With `UPSTREAMS_CONFIG_PATH` set, `/mcp/<name>` is a stateless
+proxy to the upstream of that name. Wire tool names are the upstream's own; RBAC
+and audit prefix them, so one namespaced policy file governs every route.
+
+**Aggregated.** With the same config, `/mcp` is one virtual MCP server over every
+upstream: the gateway answers `initialize`, opens a session to each upstream,
+merges the catalogs under `upstream__tool` names, and routes each call to its
+owner. A dead upstream degrades the catalog (audited) while a call to it fails.
 
 ```sh
-# GitHub as a second upstream (its own service PAT stays in-network; the user
-# token still terminates at the gateway):
-docker compose -f docker-compose.yml -f docker-compose.github.yml up -d --build
-
-# Both Postgres AND GitHub aggregated behind one /mcp endpoint:
-docker compose -f docker-compose.yml -f docker-compose.github.yml -f docker-compose.aggregate.yml up -d --build
-uv run --extra demo python demo/list_tools.py   # merged, RBAC-filtered catalog (postgres__*, github__*)
+docker compose -f docker-compose.yml -f deploy/compose/docker-compose.github.yml \
+  -f deploy/compose/docker-compose.aggregate.yml up -d --build
+uv run --extra demo python demo/list_tools.py   # the merged, filtered catalog
 ```
 
-Tool names are namespaced `upstream__tool`, governed by one policy file. See
-`upstreams.example.yaml` and `policy.aggregate.example.yaml`.
+See `examples/upstreams.example.yaml` and `examples/policy.aggregate.example.yaml`.
 
----
+## Evidence
 
-## The evidence
-
-Every governed call is logged as an attributed, hash-chained record (schema
-v1.2). Four CLIs turn that log into evidence:
+Every governed call is logged as an attributed, hash-chained record. The schema
+is locked at 1.2; 1.x changes are additive, so SIEM queries keep working.
 
 ```sh
 # Verify the audit trail hasn't been tampered with (walks the hash chain):
@@ -181,69 +157,63 @@ mcp-auth-gateway-verify-audit audit.log
 mcp-auth-gateway-export-audit audit.log > audit.siem.jsonl
 mcp-auth-gateway-export-audit audit.log audit.ocsf.jsonl --format ocsf
 
-# Generate a GRC-framework-mapped evidence report (nist-ai-rmf, eu-ai-act, soc2):
+# Generate a framework-mapped evidence report (nist-ai-rmf, eu-ai-act, soc2):
 mcp-auth-gateway-evidence-report audit.log nist-ai-rmf report.md
 
 # Build a single auditor-verifiable ZIP: the full hash-chained log, evidence
 # reports for all three frameworks (time-windowable via --from/--to),
 # Sentinel + OCSF exports, and a SHA-256 pack manifest (optionally
-# Ed25519-signed). --verify re-checks everything and exit-codes the result.
-mcp-auth-gateway-attestation-pack audit.log pack.zip
-mcp-auth-gateway-attestation-pack --verify pack.zip
+# Ed25519-signed). --verify re-checks everything and exit-codes the result;
+# --public-key pins the signer (without it the key embedded in the pack is trusted).
+mcp-auth-gateway-attestation-pack audit.log pack.zip --signing-key signing.pem
+mcp-auth-gateway-attestation-pack --verify pack.zip --public-key <hex>
 ```
 
-For the whole story end to end — allowed / denied / step-up traffic, then the
-attribution, the tamper-evident chain, and the framework report — run the
-narrated demo against the aggregate stack:
+`demo/evidence_demo.py` drives allowed, denied and step-up traffic through the
+aggregated stack and then shows the evidence. `demo/synthetic_estate.py`
+fabricates a multi-gateway audit estate, with one deliberate chain break, for
+trying the CLIs without a live gateway.
+
+## Limitations
+
+- Single process. The DPoP replay cache, aggregation sessions and the audit
+  chain live in memory or per process; run one worker. Replicas would each keep
+  their own.
+- No DPoP server nonce (RFC 9449 §8); the `iat` window and the `jti` cache bound
+  a proof's lifetime instead.
+- No session binding in single-upstream mode: `Mcp-Session-Id` is forwarded as
+  received, so one caller could act inside another's upstream session. Each
+  call is still RBAC-checked.
+- `tools/list` filtering is visibility, not enforcement; `tools/call` RBAC is the
+  control. A response the filter cannot parse passes through unchanged.
+- Tested against Entra ID only. Another OAuth 2.1 issuer should work through the
+  issuer and JWKS settings, but has not been exercised.
+- No shared state or high availability. The audit sink is a local file; export
+  it to a SIEM for retention.
+- An attestation pack's signature is checked against the pack's own embedded key
+  unless `--public-key` pins the signer.
+
+## Development
 
 ```sh
-uv run --extra demo python demo/evidence_demo.py
+uv sync --extra dev
+uv run pytest -q                                  # no tenant: in-process RSA key, respx upstreams
+uv run ruff check . && uv run ruff format --check .
+uv run python tools/config_viewer.py              # local dashboard over .env, policies, audit.log
+docker compose up -d mcp-upstream && uv run mcp-auth-gateway   # gateway on the host, upstream in Docker
 ```
 
-No live gateway handy? `demo/synthetic_estate.py` fabricates a realistic
-multi-gateway audit estate — 3 gateways, ~2.5K records with denials, step-up
-challenges, manifest drift, channel evidence, and one deliberate chain break so
-the tamper detection has something to catch. Deterministic for a given seed,
-and the output verifies with the real CLIs:
+The gateway can be exercised end to end without Entra or Docker: one small
+`http.server` script serves a fake Streamable HTTP MCP upstream, a JWKS endpoint,
+and a token mint signed by the same in-process RSA key. Point the gateway at it
+(`AUTH_ENABLED=true`, `GATEWAY_JWKS_URL=http://127.0.0.1:9701/keys`, an issuer,
+audience and resource URL that match the minted tokens, a policy file naming the
+fake tools), drive `initialize`, `tools/list` and `tools/call` with the token,
+then read `audit.log` and run the CLIs. Restart the gateway mid-run to see the
+chain continue from the log tail and the manifest baseline survive. The full
+recipe, with the Windows gotchas, is `.claude/skills/verify/SKILL.md`.
 
-```sh
-uv run python demo/synthetic_estate.py --out demo/estate
-mcp-auth-gateway-verify-audit demo/estate/prod-us/audit.log   # chain intact
-mcp-auth-gateway-verify-audit demo/estate/dev/audit.log       # tamper detected
-```
+## Security and license
 
----
-
-## Configuration & development
-
-- `AUTH_ENABLED=false` runs the pass-through (quickstart) mode; the default is
-  governed.
-- `.env.example` documents the gateway + upstream environment; `policy.example.yaml`
-  documents the RBAC map.
-- To iterate on gateway code without rebuilding the image, run just the upstream
-  in Docker and the gateway on the host:
-  ```sh
-  docker compose up -d mcp-upstream
-  uv run mcp-auth-gateway     # or: uv run uvicorn mcp_auth_gateway.main:app --port 8080
-  ```
-- Tests need no live tenant (JWKS is mocked with an in-process key; upstreams are
-  `respx`-mocked):
-  ```sh
-  uv run pytest -q
-  uv run ruff check .
-  ```
-
----
-
-## Status
-
-The gateway is a **reference implementation** of identity-governed, evidence-
-producing MCP access. Auth, RBAC, `tools/list` filtering, step-up, DPoP,
-multi-upstream aggregation, the mTLS edge overlay, and the evidence pipeline
-(attribution, tamper-evidence, structural metadata, SIEM/OCSF export,
-framework-mapped reporting, attestation packaging) are all implemented,
-tested, and demoable end to end.
-
-## License
-
-[MIT](LICENSE). Free and forkable, forever.
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+[MIT](LICENSE).

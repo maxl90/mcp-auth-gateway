@@ -1,21 +1,9 @@
-# On-prem internet-edge overlay (ADR 008 / spec Phase 1). Puts an nginx DMZ
-# proxy in front of the gateway with mTLS at the edge AND a second mTLS hop to
-# the gateway, so nothing but the proxy can even open a gateway connection.
-#
-# Phase 1 (this file) uses the throwaway test PKI from infra/edge/gen-certs.sh
-# and runs auth OFF, to prove the transport chain end-to-end from a clean
-# checkout. Layer it on the QUICKSTART stack:
-#
+# Overlay: an nginx DMZ proxy in front of the gateway. Clients present a certificate
+# to nginx (mTLS) and nginx presents its own to the gateway, which is the only way in.
 #   bash infra/edge/gen-certs.sh
-#   docker compose -f docker-compose.quickstart.yml -f docker-compose.edge.yml up --build
-#
-# Then call THROUGH the edge with a client cert (mTLS) — see the runbook
-# docs/ops/runbooks/edge-exposure.md. Direct :8080 is no longer published;
-# the only way in is 8443 → nginx → gateway.
-#
-# For the governed story (Entra + DPoP + per-call channel audit), swap the
-# quickstart base for docker-compose.yml and set DPOP_MODE / TRUST_EDGE_HEADERS
-# per the config guide — the edge overlay itself is unchanged.
+#   docker compose -f docker-compose.quickstart.yml -f deploy/compose/docker-compose.edge.yml up --build
+# Throwaway PKI from gen-certs.sh on the quickstart base (auth off); swap in
+# docker-compose.yml as the base for the governed stack. Run from the repo root.
 
 services:
   gateway:

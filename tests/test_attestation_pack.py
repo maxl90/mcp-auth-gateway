@@ -1,13 +1,16 @@
 """Attestation pack: build, verify, window, sign, tamper."""
 
+import base64
 import json
 import zipfile
 
 import pytest
+from cryptography.hazmat.primitives import serialization
 
 from mcp_auth_gateway.audit.writer import GENESIS, compute_hash
 from mcp_auth_gateway.evidence.attestation import (
     DEFAULT_FRAMEWORKS,
+    PackOptions,
     build_pack,
     generate_key,
     verify_pack,
@@ -32,8 +35,14 @@ def _rec(ts, outcome="allowed", tool="postgres__execute_sql"):
         "manifest": {"sha256": "m" * 64},
         "arguments": {
             "redacted": True,
-            "structure": {"kind": "sql", "statement_types": ["SELECT"], "tables": ["patients"],
-                          "columns": ["ssn"], "pii_columns": ["ssn"], "touches_pii": True},
+            "structure": {
+                "kind": "sql",
+                "statement_types": ["SELECT"],
+                "tables": ["patients"],
+                "columns": ["ssn"],
+                "pii_columns": ["ssn"],
+                "touches_pii": True,
+            },
             "conformance": {"schema_conformant": True},
         },
     }
@@ -44,7 +53,9 @@ def _write_chained_log(path, contents):
     lines = []
     for content in contents:
         h = compute_hash(content, prev or GENESIS)
-        lines.append(json.dumps({**content, "integrity": {"prev_hash": prev or GENESIS, "record_hash": h}}))
+        lines.append(
+            json.dumps({**content, "integrity": {"prev_hash": prev or GENESIS, "record_hash": h}})
+        )
         prev = h
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return prev  # terminal hash
@@ -53,11 +64,14 @@ def _write_chained_log(path, contents):
 @pytest.fixture
 def log(tmp_path):
     p = tmp_path / "audit.log"
-    terminal = _write_chained_log(p, [
-        _rec("2026-07-01T10:00:00.000+00:00"),
-        _rec("2026-07-02T11:00:00.000+00:00", outcome="denied"),
-        _rec("2026-07-03T12:00:00.000+00:00"),
-    ])
+    terminal = _write_chained_log(
+        p,
+        [
+            _rec("2026-07-01T10:00:00.000+00:00"),
+            _rec("2026-07-02T11:00:00.000+00:00", outcome="denied"),
+            _rec("2026-07-03T12:00:00.000+00:00"),
+        ],
+    )
     return p, terminal
 
 
@@ -75,7 +89,10 @@ def test_pack_builds_with_expected_members_and_manifest(log, tmp_path):
     assert "pack-manifest.sig" not in names  # unsigned by default
 
     assert manifest["chain"] == {
-        "ok": True, "records": 3, "detail": "chain intact", "terminal_record_hash": terminal,
+        "ok": True,
+        "records": 3,
+        "detail": "chain intact",
+        "terminal_record_hash": terminal,
     }
     assert manifest["source"]["total_records"] == 3
     assert manifest["window"] == {"from": None, "to": None, "records": 3}
@@ -129,7 +146,7 @@ def test_tampered_audit_log_fails_chain_recheck(log, tmp_path):
 def test_windowing_filters_reports_and_exports_but_keeps_full_log(log, tmp_path):
     p, _ = log
     out = tmp_path / "pack.zip"
-    manifest = build_pack(p, out, from_ts="2026-07-02", to_ts="2026-07-02")
+    manifest = build_pack(p, out, PackOptions(from_ts="2026-07-02", to_ts="2026-07-02"))
     assert manifest["source"]["total_records"] == 3
     assert manifest["window"]["records"] == 1
 
@@ -150,7 +167,7 @@ def test_signature_roundtrip_and_manifest_tamper_detection(log, tmp_path):
     key = tmp_path / "signing.pem"
     pub_hex = generate_key(key)
     out = tmp_path / "pack.zip"
-    manifest = build_pack(p, out, signing_key=key)
+    manifest = build_pack(p, out, PackOptions(signing_key=key))
     assert manifest["signature"] == {"algorithm": "ed25519", "public_key": pub_hex}
 
     ok, problems = verify_pack(out)
@@ -195,12 +212,73 @@ def test_console_bundle_shape_and_baseline_inclusion(log, tmp_path):
     baseline = tmp_path / "manifest-baseline.json"
     baseline.write_text(json.dumps({"version": "1", "tools": {}}), encoding="utf-8")
     out = tmp_path / "pack.zip"
-    build_pack(p, out, baseline_path=baseline)
+    build_pack(p, out, PackOptions(baseline_path=baseline))
 
     with zipfile.ZipFile(out) as zf:
         names = set(zf.namelist())
         report = json.loads(zf.read("evidence-report.eu-ai-act.json"))
-    # The Evidence Console's import contract: an audit*.log, an optional
-    # manifest-baseline*.json, and report bundles carrying these four keys.
+    # The pack's import contract: an audit*.log, an optional manifest-baseline*.json,
+    # and report bundles carrying these four keys.
     assert "audit.log" in names and "manifest-baseline.json" in names
     assert {"framework", "coverage", "signals", "controls"} <= set(report)
+
+
+def _resign(members: dict[str, bytes], manifest: dict, key_path) -> None:
+    """Rewrite the manifest and its detached signature with the key at ``key_path``."""
+    manifest_bytes = json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8")
+    key = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+    members["pack-manifest.json"] = manifest_bytes
+    members["pack-manifest.sig"] = base64.b64encode(key.sign(manifest_bytes))
+
+
+def test_pinned_public_key_must_match_the_signer(log, tmp_path):
+    p, _ = log
+    key = tmp_path / "signing.pem"
+    pub = generate_key(key)
+    other_pub = generate_key(tmp_path / "other.pem")
+    out = tmp_path / "pack.zip"
+    build_pack(p, out, PackOptions(signing_key=key))
+
+    ok, problems = verify_pack(out, public_key=pub)
+    assert ok, problems
+    ok, problems = verify_pack(out, public_key=other_pub)
+    assert not ok
+    assert any("pinned" in x for x in problems)
+
+
+def test_resigned_tamper_is_caught_only_by_a_pinned_key(log, tmp_path):
+    """An attacker who alters the manifest can re-sign it with their own key and
+    embed that key: the unpinned check is self-attesting and passes; the pinned
+    check fails."""
+    p, _ = log
+    key = tmp_path / "signing.pem"
+    pub = generate_key(key)
+    attacker = tmp_path / "attacker.pem"
+    attacker_pub = generate_key(attacker)
+    out = tmp_path / "pack.zip"
+    build_pack(p, out, PackOptions(signing_key=key))
+
+    with zipfile.ZipFile(out) as zf:
+        members = {n: zf.read(n) for n in zf.namelist()}
+    doctored = json.loads(members["pack-manifest.json"])
+    doctored["window"]["from"] = "2026-01-01"
+    doctored["signature"]["public_key"] = attacker_pub
+    _resign(members, doctored, attacker)
+    with zipfile.ZipFile(out, "w") as zf:
+        for n, b in members.items():
+            zf.writestr(n, b)
+
+    ok, _ = verify_pack(out)
+    assert ok  # self-attesting: the pack vouches for its own key
+    ok, problems = verify_pack(out, public_key=pub)
+    assert not ok
+    assert any("pinned" in x for x in problems)
+
+
+def test_pinning_an_unsigned_pack_is_a_problem(log, tmp_path):
+    p, _ = log
+    out = tmp_path / "pack.zip"
+    build_pack(p, out)
+    ok, problems = verify_pack(out, public_key="00" * 32)
+    assert not ok
+    assert any("no signature" in x for x in problems)

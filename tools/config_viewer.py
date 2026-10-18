@@ -3,7 +3,7 @@
 MCP Auth Gateway — Config & Log Viewer
 Single-file local web app. No dependencies (stdlib only).
 
-Run:    python viewer.py
+Run:    python tools/config_viewer.py
 Opens:  http://127.0.0.1:8787
 
 Serves live contents of the project's config and log files with tabs.
@@ -19,34 +19,36 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-BASE = Path(__file__).resolve().parent
+BASE = Path(__file__).resolve().parents[1]  # repo root
 HOST, PORT = "127.0.0.1", 8787
 
-# id, label, relative path, group, mask secrets?, is log?
+# id, label, path relative to the repo root, group, mask secrets?, is log?
+# fmt: off
 FILES = [
-    ("env",            ".env",                          ".env",                          "Environment", True,  False),
-    ("env-gen",        ".env.generated",                ".env.generated",                "Environment", True,  False),
-    ("env-ex",         ".env.example",                  ".env.example",                  "Environment", False, False),
-    ("compose",        "docker-compose.yml",            "docker-compose.yml",            "Compose",     False, False),
-    ("compose-agg",    "aggregate",                     "docker-compose.aggregate.yml",  "Compose",     False, False),
-    ("compose-edge",   "edge",                          "docker-compose.edge.yml",       "Compose",     False, False),
-    ("compose-gh",     "github",                        "docker-compose.github.yml",     "Compose",     False, False),
-    ("compose-quick",  "quickstart",                    "docker-compose.quickstart.yml", "Compose",     False, False),
-    ("policy",         "policy.generated",              "policy.generated.yaml",         "Policy",      False, False),
-    ("policy-agg",     "policy.aggregate.generated",    "policy.aggregate.generated.yaml","Policy",     False, False),
-    ("policy-gh",      "policy.github.generated",       "policy.github.generated.yaml",  "Policy",      False, False),
-    ("policy-ex",      "policy.example",                "policy.example.yaml",           "Policy",      False, False),
-    ("policy-agg-ex",  "policy.aggregate.example",      "policy.aggregate.example.yaml", "Policy",      False, False),
-    ("policy-gh-ex",   "policy.github.example",         "policy.github.example.yaml",    "Policy",      False, False),
-    ("upstreams-ex",   "upstreams.example.yaml",        "upstreams.example.yaml",        "Upstreams",   False, False),
-    ("nginx",          "nginx.conf",                    "infra/edge/nginx.conf",         "Infra",       False, False),
-    ("entra",          "entra-output.json",             "infra/entra-output.json",       "Infra",       False, False),
-    ("manifest",       "manifest-baseline.json",        "manifest-baseline.json",        "Infra",       False, False),
-    ("dockerfile",     "Dockerfile",                    "Dockerfile",                    "Project",     False, False),
-    ("pyproject",      "pyproject.toml",                "pyproject.toml",                "Project",     False, False),
-    ("ci",             "ci.yml",                        ".github/workflows/ci.yml",      "Project",     False, False),
-    ("audit",          "audit.log",                     "audit.log",                     "Logs",        False, True),
+    ("env",           ".env",                       ".env",                                        "Environment", True,  False),
+    ("env-gen",       ".env.generated",             ".env.generated",                              "Environment", True,  False),
+    ("env-ex",        ".env.example",               ".env.example",                                "Environment", False, False),
+    ("compose",       "docker-compose.yml",         "docker-compose.yml",                          "Compose",     False, False),
+    ("compose-agg",   "aggregate",                  "deploy/compose/docker-compose.aggregate.yml", "Compose",     False, False),
+    ("compose-edge",  "edge",                       "deploy/compose/docker-compose.edge.yml",      "Compose",     False, False),
+    ("compose-gh",    "github",                     "deploy/compose/docker-compose.github.yml",    "Compose",     False, False),
+    ("compose-quick", "quickstart",                 "docker-compose.quickstart.yml",               "Compose",     False, False),
+    ("policy",        "policy.generated",           "policy.generated.yaml",                       "Policy",      False, False),
+    ("policy-agg",    "policy.aggregate.generated", "policy.aggregate.generated.yaml",             "Policy",      False, False),
+    ("policy-gh",     "policy.github.generated",    "policy.github.generated.yaml",                "Policy",      False, False),
+    ("policy-ex",     "policy.example",             "examples/policy.example.yaml",                "Policy",      False, False),
+    ("policy-agg-ex", "policy.aggregate.example",   "examples/policy.aggregate.example.yaml",      "Policy",      False, False),
+    ("policy-gh-ex",  "policy.github.example",      "examples/policy.github.example.yaml",         "Policy",      False, False),
+    ("upstreams-ex",  "upstreams.example",          "examples/upstreams.example.yaml",             "Upstreams",   False, False),
+    ("nginx",         "nginx.conf",                 "infra/edge/nginx.conf",                       "Infra",       False, False),
+    ("entra",         "entra-output.json",          "infra/entra-output.json",                     "Infra",       False, False),
+    ("manifest",      "manifest-baseline.json",     "manifest-baseline.json",                      "Infra",       False, False),
+    ("dockerfile",    "Dockerfile",                 "Dockerfile",                                  "Project",     False, False),
+    ("pyproject",     "pyproject.toml",             "pyproject.toml",                              "Project",     False, False),
+    ("ci",            "ci.yml",                     ".github/workflows/ci.yml",                    "Project",     False, False),
+    ("audit",         "audit.log",                  "audit.log",                                   "Logs",        False, True),
 ]
+# fmt: on
 
 SECRET_KEY_RE = re.compile(r"(secret|token|key|pass|pwd|credential|auth)", re.I)
 ENV_LINE_RE = re.compile(r"^(\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*)(.+)$")
@@ -109,8 +111,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if url.path == "/api/manifest":
             manifest = [
-                {"id": f[0], "label": f[1], "path": f[2], "group": f[3],
-                 "masked": f[4], "isLog": f[5], "exists": (BASE / f[2]).exists()}
+                {
+                    "id": f[0],
+                    "label": f[1],
+                    "path": f[2],
+                    "group": f[3],
+                    "masked": f[4],
+                    "isLog": f[5],
+                    "exists": (BASE / f[2]).exists(),
+                }
                 for f in FILES
             ]
             self._send(200, json.dumps(manifest), "application/json")

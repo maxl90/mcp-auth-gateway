@@ -1,4 +1,4 @@
-"""Step-up auth (Phase 2, ADR 006).
+"""Step-up auth (RFC 9470).
 
 Two layers: the pure ``step_up.evaluate`` decision over synthetic claims, and
 the end-to-end enforcement through ``/mcp`` — a destructive tool without a
@@ -14,13 +14,11 @@ import time
 import httpx
 import pytest
 import respx
-from fastapi.testclient import TestClient
 
-from mcp_auth_gateway import main
 from mcp_auth_gateway.auth import step_up
 from mcp_auth_gateway.auth.policy_resolver import Policy, StepUpRequirement, _parse_destructive
 
-from .conftest import ANALYST_GROUP, ISSUER, RESOURCE_URL
+from .conftest import ANALYST_GROUP
 
 REQ = StepUpRequirement(require_acr="c1", max_age=300)
 
@@ -109,17 +107,8 @@ _POLICY = Policy(
 
 
 @pytest.fixture
-def client(validator, monkeypatch, tmp_path):
-    monkeypatch.setattr(main, "get_validator", lambda: validator)
-    monkeypatch.setattr(main, "get_policy", lambda: _POLICY)
-    monkeypatch.setattr(main.settings, "auth_enabled", True)
-    monkeypatch.setattr(main.settings, "upstream_mcp_url", UPSTREAM)
-    monkeypatch.setattr(main.settings, "gateway_resource_url", RESOURCE_URL)
-    monkeypatch.setattr(main.settings, "gateway_issuer", ISSUER)
-    monkeypatch.setattr(main.settings, "gateway_external_base_url", "")
-    monkeypatch.setattr(main.audit.settings, "audit_log_path", str(tmp_path / "audit.log"))
-    with TestClient(main.app) as c:
-        yield c
+def policy() -> Policy:
+    return _POLICY
 
 
 def _call(name: str) -> bytes:
@@ -128,11 +117,13 @@ def _call(name: str) -> bytes:
     ).encode()
 
 
-def test_destructive_without_stepup_is_challenged_not_forwarded(client, make_token, tmp_path):
+def test_destructive_without_stepup_is_challenged_not_forwarded(
+    legacy_client, make_token, tmp_path
+):
     token = make_token(groups=[ANALYST_GROUP])  # no acrs claim
     with respx.mock:
         route = respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json={}))
-        resp = client.post(
+        resp = legacy_client.post(
             "/mcp", content=_call("execute_sql"), headers={"Authorization": f"Bearer {token}"}
         )
     assert resp.status_code == 401
@@ -154,13 +145,13 @@ def test_destructive_without_stepup_is_challenged_not_forwarded(client, make_tok
     assert record["tool"] == "execute_sql"
 
 
-def test_destructive_with_fresh_stepup_forwards(client, make_token):
+def test_destructive_with_fresh_stepup_forwards(legacy_client, make_token):
     token = make_token(groups=[ANALYST_GROUP], acrs=["c1"], auth_time=int(time.time()))
     with respx.mock:
         route = respx.post(UPSTREAM).mock(
             return_value=httpx.Response(200, json={"jsonrpc": "2.0", "id": 5, "result": {}})
         )
-        resp = client.post(
+        resp = legacy_client.post(
             "/mcp", content=_call("execute_sql"), headers={"Authorization": f"Bearer {token}"}
         )
     assert resp.status_code == 200
@@ -169,26 +160,24 @@ def test_destructive_with_fresh_stepup_forwards(client, make_token):
     assert "authorization" not in {k.lower() for k in route.calls.last.request.headers}
 
 
-def test_destructive_with_stale_stepup_is_challenged(client, make_token):
-    token = make_token(
-        groups=[ANALYST_GROUP], acrs=["c1"], auth_time=int(time.time()) - 3600
-    )
+def test_destructive_with_stale_stepup_is_challenged(legacy_client, make_token):
+    token = make_token(groups=[ANALYST_GROUP], acrs=["c1"], auth_time=int(time.time()) - 3600)
     with respx.mock:
         route = respx.post(UPSTREAM).mock(return_value=httpx.Response(200, json={}))
-        resp = client.post(
+        resp = legacy_client.post(
             "/mcp", content=_call("execute_sql"), headers={"Authorization": f"Bearer {token}"}
         )
     assert resp.status_code == 401
     assert route.call_count == 0
 
 
-def test_non_destructive_tool_needs_no_stepup(client, make_token):
+def test_non_destructive_tool_needs_no_stepup(legacy_client, make_token):
     token = make_token(groups=[ANALYST_GROUP])  # no acrs
     with respx.mock:
         route = respx.post(UPSTREAM).mock(
             return_value=httpx.Response(200, json={"jsonrpc": "2.0", "id": 5, "result": {}})
         )
-        resp = client.post(
+        resp = legacy_client.post(
             "/mcp", content=_call("list_schemas"), headers={"Authorization": f"Bearer {token}"}
         )
     assert resp.status_code == 200

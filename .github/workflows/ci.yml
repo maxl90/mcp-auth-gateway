@@ -1,8 +1,8 @@
 name: CI
 
-# Runs the full test suite and linter on every push and PR. No live Entra tenant
-# is needed — token validation is exercised against an in-process RSA key with a
-# monkeypatched JWKS client (see tests/conftest.py), and upstreams are respx-mocked.
+# Lint, test under a coverage floor, and build the image on every push to master
+# and every pull request. No live Entra tenant is needed: tokens come from an
+# in-process RSA key and upstreams are respx mocks (see tests/conftest.py).
 
 on:
   push:
@@ -14,24 +14,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-
       - name: Set up Python
         run: uv python install 3.12
-
+      - name: Lock file is current
+        run: uv lock --check
       - name: Install dependencies
         run: uv sync --extra dev
-
-      - name: Lint (ruff)
+      - name: Lint
         run: uv run ruff check .
+      - name: Format
+        run: uv run ruff format --check .
 
-      - name: Run tests
-        run: uv run pytest -q
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Tests with coverage floor
+        run: uv run pytest -q --cov=mcp_auth_gateway --cov-fail-under=87
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the gateway image
+        run: docker build .

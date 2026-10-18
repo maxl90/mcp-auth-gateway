@@ -1,24 +1,14 @@
-"""Build and verify one-command attestation packs.
+"""Build and verify attestation packs.
 
-An attestation pack is a single ZIP an auditor can independently verify: the
-**full** hash-chained audit log (a sliced log can never chain-verify — its
-first ``prev_hash`` isn't genesis), framework evidence reports and SIEM exports
-computed over a declared time window, the manifest baseline when present, and a
-``pack-manifest.json`` listing the SHA-256 of every member plus the chain's
-terminal record hash. Integrity needs no keys (sha256 + ``verify-audit``
-suffice); authenticity is optional — configure an Ed25519 signing key and the
-manifest gets a detached signature.
+A pack is one ZIP an auditor can verify on their own: the full hash-chained audit
+log (a slice can never chain-verify), framework reports and SIEM exports over a
+declared window, the manifest baseline when present, and ``pack-manifest.json``
+with every member's SHA-256 and the chain's terminal hash. Integrity needs no
+keys; an optional Ed25519 signing key adds a detached signature over the manifest.
 
-Evidence tooling only (ADR 007): the pack observes and attests, nothing more.
-This is also the Evidence Console's engagement-bundle shape — a pack imports
-directly.
-
-CLI (installed as ``mcp-auth-gateway-attestation-pack``)::
-
-    mcp-auth-gateway-attestation-pack [audit_path] [out.zip]
-        [--from ISO] [--to ISO] [--framework NAME ...]
-        [--baseline PATH] [--signing-key PEM] [--name LABEL]
-    mcp-auth-gateway-attestation-pack --verify PACK.zip   # exit 0 ok / 1 fail
+    mcp-auth-gateway-attestation-pack [audit_path] [out.zip] [--from ISO] [--to ISO]
+        [--framework NAME ...] [--baseline PATH] [--signing-key PEM] [--name LABEL]
+    mcp-auth-gateway-attestation-pack --verify PACK.zip [--public-key HEX]   # exit 0 / 1
     mcp-auth-gateway-attestation-pack --generate-key PATH
 """
 
@@ -30,13 +20,16 @@ import contextlib
 import hashlib
 import json
 import sys
+import tempfile
 import zipfile
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from importlib import metadata
 from pathlib import Path
 
+from .. import __version__
 from ..audit.export import flatten_record, flatten_record_ocsf
-from ..audit.verify import verify_file
+from ..audit.log import iter_records
+from ..audit.verify import VerifyResult, verify_file
 from ..config import settings
 from . import signals as signals_mod
 from .report import build_bundle_from, render_markdown
@@ -50,11 +43,17 @@ _MANIFEST_NAME = "pack-manifest.json"
 _SIGNATURE_NAME = "pack-manifest.sig"
 
 
-def _tool_version() -> str:
-    try:
-        return metadata.version("mcp-auth-gateway")
-    except metadata.PackageNotFoundError:  # editable/source runs
-        return "unknown"
+@dataclass(frozen=True)
+class PackOptions:
+    """What goes into a pack besides the log: the frameworks to report on, the time
+    window, an optional baseline file and signing key, and a label."""
+
+    frameworks: tuple[str, ...] = DEFAULT_FRAMEWORKS
+    from_ts: str | None = None
+    to_ts: str | None = None
+    baseline_path: str | Path | None = None
+    signing_key: str | Path | None = None
+    name: str | None = None
 
 
 def _parse_bound(value: str | None, *, end: bool) -> datetime | None:
@@ -112,9 +111,7 @@ def generate_key(path: str | Path) -> str:
         serialization.NoEncryption(),
     )
     Path(path).write_bytes(pem)
-    pub = key.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw
-    )
+    pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     return pub.hex()
 
 
@@ -122,9 +119,7 @@ def _load_signer(path: str | Path):
     from cryptography.hazmat.primitives import serialization
 
     key = serialization.load_pem_private_key(Path(path).read_bytes(), password=None)
-    pub = key.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw
-    )
+    pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     return key, pub.hex()
 
 
@@ -162,7 +157,9 @@ def _verify_md(chain_ok: bool, signed: bool) -> str:
             "3. **Authenticity** — `pack-manifest.sig` is a detached Ed25519",
             "   signature (base64) over the exact bytes of `pack-manifest.json`,",
             "   by the public key recorded in the manifest's `signature` block.",
-            "   Confirm that public key out-of-band with the pack's producer.",
+            "   Confirm that public key out-of-band with the pack's producer, then pin",
+            "   it: `mcp-auth-gateway-attestation-pack --verify <zip> --public-key HEX`.",
+            "   Without the pin the check uses the embedded key and is self-attesting.",
         ]
     else:
         lines += [
@@ -184,81 +181,91 @@ def _verify_md(chain_ok: bool, signed: bool) -> str:
     return "\n".join(lines)
 
 
-def build_pack(
-    audit_path: str | Path,
-    out_zip: str | Path,
-    *,
-    frameworks: tuple[str, ...] = DEFAULT_FRAMEWORKS,
-    from_ts: str | None = None,
-    to_ts: str | None = None,
-    baseline_path: str | Path | None = None,
-    signing_key: str | Path | None = None,
-    name: str | None = None,
-) -> dict:
-    """Build the pack; return the manifest that was written into it."""
-    audit_path = Path(audit_path)
-    lo = _parse_bound(from_ts, end=False)
-    hi = _parse_bound(to_ts, end=True)
+@dataclass(frozen=True)
+class _LogSnapshot:
+    """The audit log as read once for a pack: its chain verdict, every record, and
+    the records inside the requested window."""
 
-    chain = verify_file(audit_path)
-    records = list(signals_mod.iter_records(audit_path))
-    windowed = _window(records, lo, hi)
-    terminal_hash = (records[-1].get("integrity") or {}).get("record_hash") if records else None
+    path: Path
+    chain: VerifyResult
+    records: list[dict]
+    windowed: list[dict]
 
+    @property
+    def terminal_hash(self) -> str | None:
+        if not self.records:
+            return None
+        return (self.records[-1].get("integrity") or {}).get("record_hash")
+
+
+def _snapshot(audit_path: Path, options: PackOptions) -> _LogSnapshot:
+    records = [rec for _, rec in iter_records(audit_path)]
+    lo = _parse_bound(options.from_ts, end=False)
+    hi = _parse_bound(options.to_ts, end=True)
+    return _LogSnapshot(audit_path, verify_file(audit_path), records, _window(records, lo, hi))
+
+
+def _collect_members(snap: _LogSnapshot, options: PackOptions, *, signed: bool) -> dict[str, bytes]:
+    """The evidence files: the full log, the baseline when present, one report pair
+    per framework, the two SIEM exports, and VERIFY.md."""
     # Windowed signals carry the FULL-log chain verdict (see signals.aggregate);
     # an absent log attests nothing, matching signals.compute semantics.
-    sig = signals_mod.aggregate(windowed)
-    sig.tamper_evident = chain.ok and audit_path.exists()
-    sig.chain_detail = chain.detail
+    sig = signals_mod.aggregate(snap.windowed)
+    sig.tamper_evident = snap.chain.ok and snap.path.exists()
+    sig.chain_detail = snap.chain.detail
 
     members: dict[str, bytes] = {}
-    members["audit.log"] = audit_path.read_bytes() if audit_path.exists() else b""
+    members["audit.log"] = snap.path.read_bytes() if snap.path.exists() else b""
 
-    baseline = Path(baseline_path) if baseline_path else Path(settings.manifest_baseline_path)
+    baseline = Path(options.baseline_path or settings.manifest_baseline_path)
     if baseline.exists():
         members["manifest-baseline.json"] = baseline.read_bytes()
 
-    for fw in frameworks:
-        bundle = build_bundle_from(sig, fw, audit_path)
-        bundle["coverage"]["window"] = {"from": from_ts, "to": to_ts}
+    for fw in options.frameworks:
+        bundle = build_bundle_from(sig, fw, snap.path)
+        bundle["coverage"]["window"] = {"from": options.from_ts, "to": options.to_ts}
         members[f"evidence-report.{fw}.json"] = json.dumps(bundle, indent=2).encode("utf-8")
         members[f"evidence-report.{fw}.md"] = render_markdown(bundle).encode("utf-8")
 
     for suffix, mapper in (("sentinel", flatten_record), ("ocsf", flatten_record_ocsf)):
         rows = "\n".join(
             json.dumps(mapper(rec), separators=(",", ":"), ensure_ascii=False)
-            for rec in windowed
+            for rec in snap.windowed
         )
         members[f"export.{suffix}.jsonl"] = (rows + "\n" if rows else "").encode("utf-8")
 
-    signer = pub_hex = None
-    if signing_key:
-        signer, pub_hex = _load_signer(signing_key)
+    members["VERIFY.md"] = _verify_md(snap.chain.ok, signed=signed).encode("utf-8")
+    return members
 
-    members["VERIFY.md"] = _verify_md(chain.ok, signed=signer is not None).encode("utf-8")
 
-    manifest = {
+def _build_manifest(
+    snap: _LogSnapshot, options: PackOptions, members: dict[str, bytes], pub_hex: str | None
+) -> dict:
+    return {
         "pack_format": PACK_FORMAT,
-        "name": name or audit_path.stem,
+        "name": options.name or snap.path.stem,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
-        "tool": {"name": "mcp-auth-gateway-attestation-pack", "version": _tool_version()},
-        "source": {"audit_path": str(audit_path), "total_records": len(records)},
-        "window": {"from": from_ts, "to": to_ts, "records": len(windowed)},
+        "tool": {"name": "mcp-auth-gateway-attestation-pack", "version": __version__},
+        "source": {"audit_path": str(snap.path), "total_records": len(snap.records)},
+        "window": {"from": options.from_ts, "to": options.to_ts, "records": len(snap.windowed)},
         "chain": {
-            "ok": chain.ok,
-            "records": chain.records,
-            "detail": chain.detail,
-            "terminal_record_hash": terminal_hash,
+            "ok": snap.chain.ok,
+            "records": snap.chain.records,
+            "detail": snap.chain.detail,
+            "terminal_record_hash": snap.terminal_hash,
         },
-        "frameworks": list(frameworks),
+        "frameworks": list(options.frameworks),
         "files": [
             {"name": n, "sha256": _sha256(b), "bytes": len(b)} for n, b in sorted(members.items())
         ],
-        "signature": {"algorithm": "ed25519", "public_key": pub_hex} if signer else None,
+        "signature": {"algorithm": "ed25519", "public_key": pub_hex} if pub_hex else None,
     }
-    manifest_bytes = json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8")
 
-    out_zip = Path(out_zip)
+
+def _write_zip(out_zip: Path, members: dict[str, bytes], manifest: dict, signer) -> None:
+    """Write the members, the manifest, and (when signing) the detached signature over
+    the exact manifest bytes."""
+    manifest_bytes = json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8")
     with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for member_name, data in sorted(members.items()):
             zf.writestr(member_name, data)
@@ -266,21 +273,94 @@ def build_pack(
         if signer:
             signature = base64.b64encode(signer.sign(manifest_bytes)).decode("ascii")
             zf.writestr(_SIGNATURE_NAME, signature)
+
+
+def build_pack(
+    audit_path: str | Path, out_zip: str | Path, options: PackOptions | None = None
+) -> dict:
+    """Build the pack; return the manifest that was written into it."""
+    options = options or PackOptions()
+    snap = _snapshot(Path(audit_path), options)
+    signer, pub_hex = _load_signer(options.signing_key) if options.signing_key else (None, None)
+    members = _collect_members(snap, options, signed=signer is not None)
+    manifest = _build_manifest(snap, options, members, pub_hex)
+    _write_zip(Path(out_zip), members, manifest, signer)
     return manifest
 
 
 # --- verify ---------------------------------------------------------------------
 
 
-def verify_pack(zip_path: str | Path) -> tuple[bool, list[str]]:
+def _check_members(zf: zipfile.ZipFile, names: set[str], manifest: dict) -> list[str]:
+    """Every listed member is present with the listed hash, and nothing else rides along."""
+    problems: list[str] = []
+    listed = {f["name"]: f for f in manifest.get("files", [])}
+    for member_name, entry in listed.items():
+        if member_name not in names:
+            problems.append(f"listed member missing from zip: {member_name}")
+            continue
+        if _sha256(zf.read(member_name)) != entry.get("sha256"):
+            problems.append(f"sha256 mismatch: {member_name}")
+    extras = names - set(listed) - {_MANIFEST_NAME, _SIGNATURE_NAME}
+    problems.extend(f"unlisted member in zip: {n}" for n in sorted(extras))
+    return problems
+
+
+def _check_signature(
+    zf: zipfile.ZipFile,
+    names: set[str],
+    manifest: dict,
+    manifest_bytes: bytes,
+    public_key: str | None,
+) -> list[str]:
+    """The detached signature verifies under the pinned key, or, unpinned, under the
+    key the manifest itself declares."""
+    sig_info = manifest.get("signature")
+    if not sig_info:
+        if public_key:
+            return ["a public key was pinned but the pack declares no signature"]
+        if _SIGNATURE_NAME in names:
+            return ["pack-manifest.sig present but manifest declares no signature"]
+        return []
+    problems: list[str] = []
+    embedded = sig_info.get("public_key")
+    key = public_key or embedded
+    if public_key and embedded != public_key:
+        problems.append("the manifest's embedded public key is not the pinned key")
+    if not isinstance(key, str):
+        problems.append("manifest signature block carries no public key")
+    elif _SIGNATURE_NAME not in names:
+        problems.append("manifest declares a signature but pack-manifest.sig is missing")
+    elif not _verify_signature(manifest_bytes, zf.read(_SIGNATURE_NAME).decode("ascii"), key):
+        problems.append("signature verification FAILED over pack-manifest.json")
+    return problems
+
+
+def _check_chain(zf: zipfile.ZipFile, names: set[str], manifest: dict) -> list[str]:
+    """The contained log still chain-verifies to the state the manifest declares."""
+    if "audit.log" not in names:
+        return ["audit.log missing from pack"]
+    with tempfile.TemporaryDirectory() as td:
+        log = Path(td) / "audit.log"
+        log.write_bytes(zf.read("audit.log"))
+        chain = verify_file(log)
+    declared = manifest.get("chain", {})
+    if chain.ok != declared.get("ok") or chain.records != declared.get("records"):
+        return [
+            f"chain state differs from manifest: now ok={chain.ok} "
+            f"records={chain.records}, declared ok={declared.get('ok')} "
+            f"records={declared.get('records')}"
+        ]
+    return []
+
+
+def verify_pack(zip_path: str | Path, *, public_key: str | None = None) -> tuple[bool, list[str]]:
     """Re-check a pack: member hashes, the contained chain, and any signature.
 
-    Returns (ok, problems). Verifies against a temp-extracted audit.log so the
-    chain check runs the real ``verify_file``.
+    Returns ``(ok, problems)``. ``public_key`` (hex) pins the signer: the signature
+    is checked against it and a manifest whose embedded key differs is a problem.
+    Without it the embedded key is used, which only proves self-consistency.
     """
-    import tempfile
-
-    problems: list[str] = []
     with zipfile.ZipFile(zip_path) as zf:
         names = set(zf.namelist())
         if _MANIFEST_NAME not in names:
@@ -290,45 +370,17 @@ def verify_pack(zip_path: str | Path) -> tuple[bool, list[str]]:
             manifest = json.loads(manifest_bytes)
         except ValueError as exc:
             return False, [f"{_MANIFEST_NAME} is not valid JSON ({exc})"]
-
-        listed = {f["name"]: f for f in manifest.get("files", [])}
-        for member_name, entry in listed.items():
-            if member_name not in names:
-                problems.append(f"listed member missing from zip: {member_name}")
-                continue
-            actual = _sha256(zf.read(member_name))
-            if actual != entry.get("sha256"):
-                problems.append(f"sha256 mismatch: {member_name}")
-        extras = names - set(listed) - {_MANIFEST_NAME, _SIGNATURE_NAME}
-        problems.extend(f"unlisted member in zip: {n}" for n in sorted(extras))
-
-        sig_info = manifest.get("signature")
-        if sig_info:
-            if _SIGNATURE_NAME not in names:
-                problems.append("manifest declares a signature but pack-manifest.sig is missing")
-            elif not _verify_signature(
-                manifest_bytes, zf.read(_SIGNATURE_NAME).decode("ascii"), sig_info["public_key"]
-            ):
-                problems.append("signature verification FAILED over pack-manifest.json")
-        elif _SIGNATURE_NAME in names:
-            problems.append("pack-manifest.sig present but manifest declares no signature")
-
-        if "audit.log" in names:
-            with tempfile.TemporaryDirectory() as td:
-                log = Path(td) / "audit.log"
-                log.write_bytes(zf.read("audit.log"))
-                chain = verify_file(log)
-            declared = manifest.get("chain", {})
-            if chain.ok != declared.get("ok") or chain.records != declared.get("records"):
-                problems.append(
-                    f"chain state differs from manifest: now ok={chain.ok} "
-                    f"records={chain.records}, declared ok={declared.get('ok')} "
-                    f"records={declared.get('records')}"
-                )
-        else:
-            problems.append("audit.log missing from pack")
-
+        problems = (
+            _check_members(zf, names, manifest)
+            + _check_signature(zf, names, manifest, manifest_bytes, public_key)
+            + _check_chain(zf, names, manifest)
+        )
     return not problems, problems
+
+
+def _is_signed(zip_path: str | Path) -> bool:
+    with zipfile.ZipFile(zip_path) as zf:
+        return bool(json.loads(zf.read(_MANIFEST_NAME)).get("signature"))
 
 
 # --- CLI -------------------------------------------------------------------------
@@ -356,6 +408,12 @@ def main() -> None:
     ap.add_argument("--signing-key", default=None, help="Ed25519 private key PEM (optional)")
     ap.add_argument("--name", default=None, help="pack label (defaults to the log's stem)")
     ap.add_argument("--verify", default=None, metavar="ZIP", help="verify a pack instead")
+    ap.add_argument(
+        "--public-key",
+        default=None,
+        metavar="HEX",
+        help="with --verify: the signer's public key; without it the embedded key is trusted",
+    )
     ap.add_argument("--generate-key", default=None, metavar="PATH", help="write a new key PEM")
     args = ap.parse_args()
 
@@ -366,9 +424,12 @@ def main() -> None:
         raise SystemExit(0)
 
     if args.verify:
-        ok, problems = verify_pack(args.verify)
+        ok, problems = verify_pack(args.verify, public_key=args.public_key)
         if ok:
             print(f"OK: pack verified ({args.verify})")
+            if _is_signed(args.verify):
+                which = "pinned key" if args.public_key else "embedded (unpinned) key"
+                print(f"signature: valid for {which}")
             raise SystemExit(0)
         print(f"PACK VERIFICATION FAILED: {args.verify}", file=sys.stderr)
         for p in problems:
@@ -380,12 +441,14 @@ def main() -> None:
     manifest = build_pack(
         args.audit_path,
         out,
-        frameworks=tuple(args.framework) if args.framework else DEFAULT_FRAMEWORKS,
-        from_ts=args.from_ts,
-        to_ts=args.to_ts,
-        baseline_path=args.baseline,
-        signing_key=args.signing_key,
-        name=args.name,
+        PackOptions(
+            frameworks=tuple(args.framework) if args.framework else DEFAULT_FRAMEWORKS,
+            from_ts=args.from_ts,
+            to_ts=args.to_ts,
+            baseline_path=args.baseline,
+            signing_key=args.signing_key,
+            name=args.name,
+        ),
     )
     chain = manifest["chain"]
     state = "intact" if chain["ok"] else f"BROKEN ({chain['detail']})"

@@ -1,21 +1,8 @@
-# Zero-config quickstart — the gateway + a sample MCP upstream + a seeded
-# Postgres, with **auth turned off**, so you can see the proxy working in one
-# command from a clean checkout, with NO Entra tenant and NO provisioning:
-#
-#     docker compose -f docker-compose.quickstart.yml up --build
-#     curl -s -X POST http://localhost:8080/mcp \
-#       -H 'content-type: application/json' \
-#       -H 'accept: application/json, text/event-stream' \
-#       -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-#
-# This is the "does it run?" on-ramp. It is NOT the governed configuration:
-# AUTH_ENABLED=false means every request passes through unauthenticated — the
-# gateway is a plain proxy here. To see the real story (Entra auth, tool-level
-# RBAC, redacted+attributed audit, step-up, aggregation), provision a dev tenant
-# and use docker-compose.yml (+ the github / aggregate overlays). See the README.
-#
-# Self-contained: no .env.generated, no policy file needed (auth off loads
-# neither), no external images beyond Postgres and what this repo builds.
+# Zero-config quickstart: gateway + sample MCP upstream + seeded Postgres, with
+# AUTH_ENABLED=false so it runs from a clean checkout with no Entra tenant.
+#   docker compose -f docker-compose.quickstart.yml up --build
+# Then POST a JSON-RPC tools/list to http://localhost:8080/mcp (see README).
+# Pass-through only: nothing is authenticated. The governed stack is docker-compose.yml.
 
 name: mcp-auth-gateway-quickstart
 
@@ -37,7 +24,7 @@ services:
       POSTGRES_PASSWORD: demo
       POSTGRES_DB: clinic
     volumes:
-      - ./db/seed:/docker-entrypoint-initdb.d:ro
+      - ./deploy/db/seed:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U demo -d clinic"]
       interval: 3s
@@ -45,7 +32,7 @@ services:
       retries: 20
 
   mcp-upstream:
-    build: ./upstream
+    build: ./deploy/upstreams/postgres
     environment:
       DATABASE_URI: postgresql://demo:demo@db:5432/clinic
     depends_on:

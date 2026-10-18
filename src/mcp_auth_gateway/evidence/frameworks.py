@@ -1,16 +1,11 @@
-"""Framework control maps: which audit *signals* attest which GRC control.
+"""Framework control maps: which audit signals attest which control.
 
-A control map is data, not code — each control names the ``signals`` (see
-``signals.Signals.flags``) whose presence in the audit log provides evidence
-toward it. Built-in **starters** ship for NIST AI RMF 1.0, the EU AI Act
-(Regulation (EU) 2024/1689, high-risk lens), and SOC 2 (2017 TSC); the exact
-control text and sufficiency must be refined with counsel per engagement.
-``report`` can also load a custom map (same shape) so the consulting
-engagement tailors it per client — the rich multi-framework engine remains the
-paid control plane's job; these starters stay deliberately basic (ADR 003/007).
-
-Framing note: a control is *attested by evidence* here, not *complied with* —
-the audit trail is one input to a control's assessment, not the whole judgment.
+A control map is data: each control names the ``signals`` (see
+``signals.Signals.flags``) whose presence in the audit log is evidence toward it.
+Starters ship for NIST AI RMF 1.0, the EU AI Act (Regulation (EU) 2024/1689,
+high-risk lens) and SOC 2 (2017 TSC); ``report`` can load a custom map of the
+same shape. A control is attested by evidence here, not complied with: the audit
+trail is one input to its assessment, not the whole judgment.
 """
 
 from __future__ import annotations

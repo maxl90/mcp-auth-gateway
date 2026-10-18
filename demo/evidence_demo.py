@@ -1,7 +1,7 @@
-"""Narrated end-to-end evidence demo — the pivot's story in ~90 seconds.
+"""Narrated end-to-end evidence demo, about 90 seconds.
 
-Drives real governed traffic through the gateway, then surfaces the **evidence**
-that is the product thesis (ADR 007): every agent action attributed to an agent
+Drives real governed traffic through the gateway, then surfaces the **evidence**:
+every agent action attributed to an agent
 acting on behalf of a human, structural (value-free) metadata of what it touched,
 a tamper-evident trail, and a framework-mapped evidence report.
 
@@ -46,7 +46,7 @@ AUDIT_PATH = os.environ.get("GATEWAY_CONTAINER_AUDIT", "/app/audit.log")
 
 
 def _beat(n: int, title: str) -> None:
-    print(f"\n{'='*70}\n[{n}] {title}\n{'='*70}")
+    print(f"\n{'=' * 70}\n[{n}] {title}\n{'=' * 70}")
 
 
 def _call(headers: dict, name: str, arguments: dict) -> httpx.Response:
@@ -67,7 +67,11 @@ def _docker(*args: str) -> str | None:
     try:
         out = subprocess.run(
             ["docker", "exec", CONTAINER, *args],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
         )
     except (FileNotFoundError, subprocess.SubprocessError):
         return None
@@ -77,19 +81,30 @@ def _docker(*args: str) -> str | None:
 
 
 def main() -> None:
-    print("\nAIIG — Agent Attribution & Audit-Evidence demo")
+    print("\nmcp-auth-gateway: agent attribution and audit-evidence demo")
     token = client._login()
 
     _beat(1, "One aggregated session over every governed upstream")
     H = {"Authorization": f"Bearer {token}", "Accept": "application/json, text/event-stream"}
-    init = httpx.post(client.GATEWAY_URL, headers=H, json={
-        "jsonrpc": "2.0", "id": 0, "method": "initialize",
-        "params": {"protocolVersion": "2025-06-18", "capabilities": {}}})
+    init = httpx.post(
+        client.GATEWAY_URL,
+        headers=H,
+        json={
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}},
+        },
+    )
     H["Mcp-Session-Id"] = init.headers["mcp-session-id"]
-    httpx.post(client.GATEWAY_URL, headers=H,
-               json={"jsonrpc": "2.0", "method": "notifications/initialized"})
-    tools = httpx.post(client.GATEWAY_URL, headers=H,
-                       json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()
+    httpx.post(
+        client.GATEWAY_URL,
+        headers=H,
+        json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+    )
+    tools = httpx.post(
+        client.GATEWAY_URL, headers=H, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    ).json()
     names = [t["name"] for t in tools["result"]["tools"]]
     print(f"  merged, RBAC-filtered catalog: {len(names)} tools across upstreams")
     print("  e.g.", ", ".join(names[:4]), "...")
@@ -103,8 +118,7 @@ def main() -> None:
     print(f"  postgres__pg_superpower -> HTTP {r.status_code} (denied, never forwarded)")
 
     _beat(4, "A destructive SQL call touching PII — step-up challenged, still logged")
-    r = _call(H, "postgres__execute_sql",
-              {"sql": "DELETE FROM patients WHERE ssn = '123-45-6789'"})
+    r = _call(H, "postgres__execute_sql", {"sql": "DELETE FROM patients WHERE ssn = '123-45-6789'"})
     print(f"  postgres__execute_sql -> HTTP {r.status_code} (step-up required, RFC 9470)")
     print("  the SSN value stays at the gateway — watch it be ABSENT from the evidence below")
     httpx.request("DELETE", client.GATEWAY_URL, headers=H)
@@ -127,13 +141,17 @@ def main() -> None:
         print(f"\n  - {rec['tool']}  [{rec['outcome']}]")
         print(f"      agent {agent}  on behalf of  {human}")
         if struct.get("kind") == "sql":
-            print(f"      touched tables={struct.get('tables')} pii_columns={struct.get('pii_columns')}")
+            print(
+                f"      touched tables={struct.get('tables')} pii_columns={struct.get('pii_columns')}"
+            )
         print(f"      hash {rec['integrity']['record_hash'][:16]}...  (chained)")
 
     if "123-45-6789" in tail:
         print("\n  !! SSN value leaked into the evidence — trust boundary broken")
     else:
-        print("\n  ✓ the SSN value appears NOWHERE in the evidence (values never leave the gateway)")
+        print(
+            "\n  ✓ the SSN value appears NOWHERE in the evidence (values never leave the gateway)"
+        )
 
     print("\n  Verifying the tamper-evident chain:")
     verify = _docker("mcp-auth-gateway-verify-audit", AUDIT_PATH)

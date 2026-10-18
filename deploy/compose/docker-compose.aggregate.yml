@@ -1,0 +1,22 @@
+# Overlay: Postgres and GitHub together behind one aggregated /mcp endpoint, with a
+# merged, namespaced catalog (postgres__*, github__*) and per-call routing.
+#   docker compose -f docker-compose.yml -f deploy/compose/docker-compose.github.yml \
+#     -f deploy/compose/docker-compose.aggregate.yml up -d --build
+# Needs the GitHub overlay's prerequisites plus policy.aggregate.generated.yaml at the
+# repo root, copied from examples/. Run from the repo root.
+
+services:
+  gateway:
+    environment:
+      # Aggregation mode: the upstream set comes from upstreams.yaml, not
+      # UPSTREAM_MCP_URL (which the github overlay set — override it back so a
+      # stray read of it can't point anywhere surprising).
+      UPSTREAMS_CONFIG_PATH: /app/upstreams.yaml
+      UPSTREAM_MCP_URL: ""
+      POLICY_PATH: /app/policy.aggregate.generated.yaml
+    volumes:
+      - ./examples/upstreams.example.yaml:/app/upstreams.yaml:ro
+      - ./policy.aggregate.generated.yaml:/app/policy.aggregate.generated.yaml:ro
+    depends_on:
+      - mcp-upstream
+      - github-upstream

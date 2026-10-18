@@ -1,4 +1,4 @@
-"""Upstream config loading + namespacing (Phase 3).
+"""Upstream config loading + namespacing.
 
 Fail-closed loading (a misconfigured aggregator must not start) and the
 namespace scheme that keeps one policy file unambiguous across upstreams.
@@ -8,11 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from mcp_auth_gateway.upstreams import (
-    load_upstreams,
-    namespace_tool,
-    split_namespaced,
-)
+from mcp_auth_gateway.naming import namespace_tool, split_namespaced
+from mcp_auth_gateway.upstreams import load_upstreams
 
 
 def _write(tmp_path, text: str):

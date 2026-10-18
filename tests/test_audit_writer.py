@@ -30,7 +30,9 @@ def _reset_chain():
 
 def test_record_captures_action_and_outcome():
     rec = writer.build_record(
-        outcome="allowed", tool="execute_sql", correlation_id="abc", claims=_CLAIMS
+        writer.AuditEvent(
+            outcome="allowed", tool="execute_sql", correlation_id="abc", claims=_CLAIMS
+        )
     )
     assert rec["outcome"] == "allowed"
     assert rec["tool"] == "execute_sql"
@@ -44,7 +46,9 @@ def test_attribution_splits_agent_from_human():
     """The attribution problem, made explicit: the acting agent (app) is distinct
     from the human it acted on behalf of."""
     rec = writer.build_record(
-        outcome="allowed", tool="execute_sql", correlation_id="abc", claims=_CLAIMS
+        writer.AuditEvent(
+            outcome="allowed", tool="execute_sql", correlation_id="abc", claims=_CLAIMS
+        )
     )
     actor = rec["actor"]
     assert actor["agent"] == {"app_id": "agent-app-id-999", "name": "Demo Agent"}
@@ -54,10 +58,12 @@ def test_attribution_splits_agent_from_human():
 
 def test_app_only_token_has_no_human():
     rec = writer.build_record(
-        outcome="allowed",
-        tool="execute_sql",
-        correlation_id="abc",
-        claims={"azp": "app-1", "idtyp": "app", "oid": "sp-oid"},
+        writer.AuditEvent(
+            outcome="allowed",
+            tool="execute_sql",
+            correlation_id="abc",
+            claims={"azp": "app-1", "idtyp": "app", "oid": "sp-oid"},
+        )
     )
     assert rec["actor"]["agent"]["app_id"] == "app-1"
     assert rec["actor"]["on_behalf_of"] is None
@@ -66,11 +72,13 @@ def test_app_only_token_has_no_human():
 def test_arguments_values_never_recorded():
     """No argument values, ever — even when structural metadata is attached."""
     rec = writer.build_record(
-        outcome="allowed",
-        tool="execute_sql",
-        correlation_id="abc",
-        claims=_CLAIMS,
-        structure={"kind": "sql", "tables": ["patients"], "columns": ["ssn"]},
+        writer.AuditEvent(
+            outcome="allowed",
+            tool="execute_sql",
+            correlation_id="abc",
+            claims=_CLAIMS,
+            structure={"kind": "sql", "tables": ["patients"], "columns": ["ssn"]},
+        )
     )
     assert rec["arguments"]["redacted"] is True
     serialized = json.dumps(rec)
@@ -80,11 +88,13 @@ def test_arguments_values_never_recorded():
 
 def test_denied_record_carries_reason():
     rec = writer.build_record(
-        outcome="denied",
-        tool="execute_sql",
-        correlation_id="abc",
-        claims=_CLAIMS,
-        reason="tool not permitted",
+        writer.AuditEvent(
+            outcome="denied",
+            tool="execute_sql",
+            correlation_id="abc",
+            claims=_CLAIMS,
+            reason="tool not permitted",
+        )
     )
     assert rec["outcome"] == "denied"
     assert rec["reason"] == "tool not permitted"
@@ -93,8 +103,8 @@ def test_denied_record_carries_reason():
 def test_write_appends_chained_json_line(tmp_path, monkeypatch, capsys):
     log = tmp_path / "audit.log"
     monkeypatch.setattr(writer.settings, "audit_log_path", str(log))
-    writer.record(outcome="allowed", tool="list_schemas", correlation_id="cid1")
-    writer.record(outcome="denied", tool="execute_sql", correlation_id="cid2")
+    writer.record(writer.AuditEvent(outcome="allowed", tool="list_schemas", correlation_id="cid1"))
+    writer.record(writer.AuditEvent(outcome="denied", tool="execute_sql", correlation_id="cid2"))
 
     lines = log.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2

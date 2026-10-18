@@ -1,7 +1,7 @@
-"""Phase 0 smoke test — a raw MCP client hitting the containerized upstream
+"""Smoke test: a raw MCP client hitting the containerized upstream
 directly over Streamable HTTP (no gateway in the path yet).
 
-Confirms Task 2's exit criteria: the upstream serves Streamable HTTP and a real
+Confirms the upstream serves Streamable HTTP and a real
 MCP client can `initialize`, `tools/list`, and `tools/call` against it.
 
 Usage:

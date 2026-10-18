@@ -23,9 +23,22 @@ OUTCOMES = {"allowed", "denied", "degraded", "step_up_required", "manifest_drift
 
 def _generate(out: Path, *extra: str) -> dict:
     subprocess.run(
-        [sys.executable, str(SCRIPT), "--out", str(out), "--seed", "7", "--end", END,
-         "--scale", "0.2", *extra],
-        check=True, capture_output=True, text=True,
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--out",
+            str(out),
+            "--seed",
+            "7",
+            "--end",
+            END,
+            "--scale",
+            "0.2",
+            *extra,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
     )
     return json.loads((out / "estate.json").read_text(encoding="utf-8"))
 
@@ -67,7 +80,9 @@ def test_deterministic_for_same_seed(estate, tmp_path):
     out, _ = estate
     _generate(tmp_path)
     for label in ("prod-us", "prod-eu", "dev"):
-        assert (tmp_path / label / "audit.log").read_bytes() == (out / label / "audit.log").read_bytes()
+        assert (tmp_path / label / "audit.log").read_bytes() == (
+            out / label / "audit.log"
+        ).read_bytes()
 
 
 def test_records_match_the_locked_schema(estate):
@@ -84,7 +99,11 @@ def test_records_match_the_locked_schema(estate):
             if rec["actor"]["on_behalf_of"] is None:
                 saw_app_only = True
             if rec["channel"]:
-                assert set(rec["channel"]) == {"edge_client_cert_serial", "edge_client_cert_dn", "dpop_jkt"}
+                assert set(rec["channel"]) == {
+                    "edge_client_cert_serial",
+                    "edge_client_cert_dn",
+                    "dpop_jkt",
+                }
                 saw_channel = True
             saw_step_up = saw_step_up or rec["outcome"] == "step_up_required"
             saw_denied = saw_denied or rec["outcome"] == "denied"
@@ -108,10 +127,16 @@ def test_manifest_drift_story_is_coherent(estate):
         assert drift["tool"] == tool
         assert drift["manifest"]["previous_sha256"] != drift["manifest"]["sha256"]
 
-        stamps_before = {r["manifest"]["sha256"] for r in recs[: drift_idx[0]]
-                         if r.get("tool") == tool and r.get("manifest")}
-        stamps_after = {r["manifest"]["sha256"] for r in recs[drift_idx[0] + 1:]
-                        if r.get("tool") == tool and r["outcome"] != "manifest_drift" and r.get("manifest")}
+        stamps_before = {
+            r["manifest"]["sha256"]
+            for r in recs[: drift_idx[0]]
+            if r.get("tool") == tool and r.get("manifest")
+        }
+        stamps_after = {
+            r["manifest"]["sha256"]
+            for r in recs[drift_idx[0] + 1 :]
+            if r.get("tool") == tool and r["outcome"] != "manifest_drift" and r.get("manifest")
+        }
         assert stamps_before <= {drift["manifest"]["previous_sha256"]}
         assert stamps_after <= {drift["manifest"]["sha256"]}
 
@@ -130,6 +155,13 @@ def test_no_argument_values_anywhere(estate):
         for rec in _records(out, source["label"]):
             structure = rec["arguments"]["structure"]
             if structure and structure["kind"] == "sql" and not structure.get("parse_error"):
-                assert set(structure) == {"kind", "statement_types", "tables", "columns", "pii_columns", "touches_pii"}
+                assert set(structure) == {
+                    "kind",
+                    "statement_types",
+                    "tables",
+                    "columns",
+                    "pii_columns",
+                    "touches_pii",
+                }
             if structure and structure["kind"] == "generic":
                 assert set(structure) == {"kind", "arg_keys"}

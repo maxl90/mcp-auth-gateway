@@ -23,19 +23,41 @@ def _seed_log(path, monkeypatch):
     monkeypatch.setattr(writer.settings, "audit_log_path", str(path))
     agent_human = {"oid": "human-1", "preferred_username": "a@b.com", "azp": "agent-1", "tid": "t1"}
     writer.record(
-        outcome="allowed", tool="postgres__list_schemas", correlation_id="c1",
-        upstream="postgres", claims=agent_human,
-        structure={"kind": "generic", "arg_keys": []},
+        writer.AuditEvent(
+            outcome="allowed",
+            tool="postgres__list_schemas",
+            correlation_id="c1",
+            upstream="postgres",
+            claims=agent_human,
+            structure={"kind": "generic", "arg_keys": []},
+        )
     )
     writer.record(
-        outcome="denied", tool="github__delete_file", correlation_id="c2",
-        upstream="github", claims=agent_human, reason="not permitted",
+        writer.AuditEvent(
+            outcome="denied",
+            tool="github__delete_file",
+            correlation_id="c2",
+            upstream="github",
+            claims=agent_human,
+            reason="not permitted",
+        )
     )
     writer.record(
-        outcome="step_up_required", tool="postgres__execute_sql", correlation_id="c3",
-        upstream="postgres", claims=agent_human,
-        structure={"kind": "sql", "tables": ["patients"], "columns": ["mrn"],
-                   "pii_columns": ["mrn"], "touches_pii": True, "statement_types": ["SELECT"]},
+        writer.AuditEvent(
+            outcome="step_up_required",
+            tool="postgres__execute_sql",
+            correlation_id="c3",
+            upstream="postgres",
+            claims=agent_human,
+            structure={
+                "kind": "sql",
+                "tables": ["patients"],
+                "columns": ["mrn"],
+                "pii_columns": ["mrn"],
+                "touches_pii": True,
+                "statement_types": ["SELECT"],
+            },
+        )
     )
 
 

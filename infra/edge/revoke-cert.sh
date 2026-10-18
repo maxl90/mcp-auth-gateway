@@ -7,7 +7,7 @@
 #         (CERTS_DIR defaults to ./certs next to this script)
 #
 # nginx reads ssl_crl at config load, so after revoking, reload the edge:
-#   docker compose -f docker-compose.quickstart.yml -f docker-compose.edge.yml \
+#   docker compose -f docker-compose.quickstart.yml -f deploy/compose/docker-compose.edge.yml \
 #     exec edge nginx -s reload
 set -euo pipefail
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*"

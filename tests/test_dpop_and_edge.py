@@ -1,4 +1,4 @@
-"""DPoP (RFC 9449) sender-constrained tokens + edge channel identity (ADR 008).
+"""DPoP (RFC 9449) sender-constrained tokens + edge channel identity.
 
 Covers the resource-server checks of §4.3 (signature by the embedded key,
 htm/htu, iat window, ath token hash, jti replay, cnf.jkt binding), the §7.1
@@ -19,14 +19,12 @@ import jwt as pyjwt
 import pytest
 import respx
 from cryptography.hazmat.primitives.asymmetric import ec
-from fastapi.testclient import TestClient
 
 from mcp_auth_gateway import main
-from mcp_auth_gateway.audit import writer
 from mcp_auth_gateway.auth import dpop
 from mcp_auth_gateway.auth.policy_resolver import Policy
 
-from .conftest import ANALYST_GROUP, ISSUER, RESOURCE_URL
+from .conftest import ANALYST_GROUP
 
 UPSTREAM = "http://localhost:9000/mcp"
 HTU = "https://mcp.example.test/mcp"
@@ -174,7 +172,7 @@ def test_private_key_members_in_jwk_rejected(client_key):
         _validate(client_key, make_proof(client_key, jwk=jwk))
 
 
-# --- enforcement modes (§7.1 + ADR 008) --------------------------------------
+# --- enforcement modes (§7.1) ------------------------------------------------
 
 
 def _enforce(scheme, token, claims, proofs, monkeypatch=None, mode=None):
@@ -231,20 +229,8 @@ _POLICY = Policy(groups={ANALYST_GROUP: ["list_schemas"]}, destructive=[])
 
 
 @pytest.fixture
-def client(validator, monkeypatch, tmp_path):
-    monkeypatch.setattr(main, "get_validator", lambda: validator)
-    monkeypatch.setattr(main, "get_policy", lambda: _POLICY)
-    monkeypatch.setattr(main.settings, "auth_enabled", True)
-    monkeypatch.setattr(main.settings, "upstream_mcp_url", UPSTREAM)
-    monkeypatch.setattr(main.settings, "gateway_resource_url", RESOURCE_URL)
-    monkeypatch.setattr(main.settings, "gateway_issuer", ISSUER)
-    monkeypatch.setattr(main.settings, "gateway_external_base_url", "")
-    monkeypatch.setattr(main.settings, "dpop_mode", "if_present")
-    monkeypatch.setattr(writer.settings, "audit_log_path", str(tmp_path / "audit.log"))
-    writer._chain["path"] = None
-    writer._chain["last_hash"] = None
-    with TestClient(main.app) as c:
-        yield c
+def policy() -> Policy:
+    return _POLICY
 
 
 def _records(tmp_path):
@@ -260,17 +246,17 @@ def _call_body() -> bytes:
     ).encode()
 
 
-def test_bound_token_with_proof_forwards_and_audits_jkt(client, make_token, client_key, tmp_path):
+def test_bound_token_with_proof_forwards_and_audits_jkt(
+    legacy_client, make_token, client_key, tmp_path
+):
     jkt = dpop.jwk_thumbprint(_ec_jwk(client_key))
     token = make_token(groups=[ANALYST_GROUP], cnf={"jkt": jkt})
-    proof = make_proof(
-        client_key, htu="http://testserver/mcp", access_token=token
-    )
+    proof = make_proof(client_key, htu="http://testserver/mcp", access_token=token)
     with respx.mock:
         respx.post(UPSTREAM).mock(
             return_value=httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
         )
-        resp = client.post(
+        resp = legacy_client.post(
             "/mcp",
             content=_call_body(),
             headers={"Authorization": f"DPoP {token}", "DPoP": proof},
@@ -281,7 +267,7 @@ def test_bound_token_with_proof_forwards_and_audits_jkt(client, make_token, clie
     assert recs[0]["channel"] == {"dpop_jkt": jkt}
 
 
-def test_replayed_proof_is_401_with_dpop_challenge(client, make_token, client_key):
+def test_replayed_proof_is_401_with_dpop_challenge(legacy_client, make_token, client_key):
     jkt = dpop.jwk_thumbprint(_ec_jwk(client_key))
     token = make_token(groups=[ANALYST_GROUP], cnf={"jkt": jkt})
     proof = make_proof(client_key, htu="http://testserver/mcp", access_token=token)
@@ -289,10 +275,10 @@ def test_replayed_proof_is_401_with_dpop_challenge(client, make_token, client_ke
         respx.post(UPSTREAM).mock(
             return_value=httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
         )
-        first = client.post(
+        first = legacy_client.post(
             "/mcp", content=_call_body(), headers={"Authorization": f"DPoP {token}", "DPoP": proof}
         )
-        replay = client.post(
+        replay = legacy_client.post(
             "/mcp", content=_call_body(), headers={"Authorization": f"DPoP {token}", "DPoP": proof}
         )
     assert first.status_code == 200
@@ -301,16 +287,16 @@ def test_replayed_proof_is_401_with_dpop_challenge(client, make_token, client_ke
     assert "replay" in replay.json()["detail"]
 
 
-def test_stolen_bound_token_as_bearer_is_401(client, make_token, client_key):
+def test_stolen_bound_token_as_bearer_is_401(legacy_client, make_token, client_key):
     jkt = dpop.jwk_thumbprint(_ec_jwk(client_key))
     token = make_token(groups=[ANALYST_GROUP], cnf={"jkt": jkt})
-    resp = client.post(
+    resp = legacy_client.post(
         "/mcp", content=_call_body(), headers={"Authorization": f"Bearer {token}"}
     )
     assert resp.status_code == 401  # bound token, no possession proof — dead
 
 
-def test_edge_headers_recorded_only_when_trusted(client, make_token, tmp_path, monkeypatch):
+def test_edge_headers_recorded_only_when_trusted(legacy_client, make_token, tmp_path, monkeypatch):
     token = make_token(groups=[ANALYST_GROUP])
     headers = {
         "Authorization": f"Bearer {token}",
@@ -322,9 +308,9 @@ def test_edge_headers_recorded_only_when_trusted(client, make_token, tmp_path, m
             return_value=httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
         )
         monkeypatch.setattr(main.settings, "trust_edge_headers", False)
-        client.post("/mcp", content=_call_body(), headers=headers)
+        legacy_client.post("/mcp", content=_call_body(), headers=headers)
         monkeypatch.setattr(main.settings, "trust_edge_headers", True)
-        client.post("/mcp", content=_call_body(), headers=headers)
+        legacy_client.post("/mcp", content=_call_body(), headers=headers)
 
     recs = _records(tmp_path)
     assert recs[0]["channel"] is None  # untrusted: spoofable header ignored

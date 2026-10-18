@@ -1,16 +1,9 @@
-"""Protected Resource Metadata (RFC 9728) + discovery helpers — Phase 1.5.
+"""Protected Resource Metadata (RFC 9728): how a cold client finds the authorization server.
 
-The gateway is an OAuth 2.1 *resource server*. A spec-compliant MCP client that
-hits a protected route cold gets a 401 whose ``WWW-Authenticate`` header points
-at the Protected Resource Metadata (PRM) document served from this module; the
-client reads it to learn this gateway's canonical resource identifier and which
-authorization server (Entra) to obtain a token from. This is step 1 of the MCP
-authorization handshake.
-
-No governance logic lives here — this is the authentication-handshake discovery
-anchor only (REQ-1.5.3/1.5.4). RBAC, audit, and step-up remain Phase 2+. The
-gateway is a resource server, not an authorization server, so Dynamic Client
-Registration is deliberately out of scope (that's Entra's concern).
+The gateway is an OAuth 2.1 resource server. An unauthenticated request gets a
+401 whose ``WWW-Authenticate`` header points at the PRM document served here; the
+client reads the gateway's resource identifier and authorization server from it.
+Dynamic Client Registration is out of scope: Entra, not the gateway, is the AS.
 """
 
 from __future__ import annotations
@@ -23,12 +16,10 @@ PRM_WELL_KNOWN_PATH = "/.well-known/oauth-protected-resource"
 
 
 def build_prm_document() -> dict:
-    """Return the Protected Resource Metadata document (RFC 9728).
+    """The PRM document (RFC 9728), built from settings.
 
-    Values come from settings, never hardcoded. Raises :class:`RuntimeError` if
-    the canonical resource URL is unset — the boot path calls this so a
-    misconfigured gateway fails closed (refuses to start) rather than serving a
-    resource document that can't be matched against any token audience.
+    Raises :class:`RuntimeError` when ``GATEWAY_RESOURCE_URL`` is unset; the boot
+    path calls this so a misconfigured gateway refuses to start.
     """
     resource = settings.gateway_resource_url
     if not resource:
@@ -52,13 +43,10 @@ def build_prm_document() -> dict:
 
 
 def resource_metadata_url(request_base_url: str) -> str:
-    """Absolute URL of the PRM document, for the ``resource_metadata`` pointer
-    in a 401 ``WWW-Authenticate`` header (REQ-1.5.4).
+    """Absolute URL of the PRM document for a 401's ``resource_metadata`` pointer.
 
-    Prefers the configured external base URL (so the pointer is correct when the
-    gateway sits behind a reverse proxy); otherwise uses the origin of the
-    incoming request. The result must be fetchable by an external client, so we
-    never build it from the ``api://`` resource URI.
+    Uses the configured external base URL when set (correct behind a reverse proxy),
+    else the request origin. Never built from the ``api://`` resource URI.
     """
     base = settings.gateway_external_base_url or request_base_url
     return f"{base.rstrip('/')}{PRM_WELL_KNOWN_PATH}"

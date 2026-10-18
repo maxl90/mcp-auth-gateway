@@ -32,14 +32,14 @@ def test_wrong_audience_rejected(validator, make_token):
 
 
 def test_array_audience_with_match_passes(validator, make_token):
-    """RFC 8707 / REQ-1.5.1: `aud` may be an array; accept if any entry is the
+    """RFC 8707: `aud` may be an array; accept if any entry is the
     gateway's audience, even alongside audiences for other resources."""
     claims = validator.validate(make_token(aud=[AUDIENCE, "another-resource"]))
     assert AUDIENCE in claims["aud"]
 
 
 def test_missing_audience_rejected(validator, rsa_key):
-    """REQ-1.5.1: a token with no `aud` claim is rejected (require aud)."""
+    """A token with no `aud` claim is rejected (require aud)."""
     now = int(time.time())
     token = jwt.encode(
         {"iss": ISSUER, "iat": now, "exp": now + 3600, "groups": [ANALYST_GROUP]},
@@ -57,8 +57,7 @@ def test_wrong_issuer_rejected(validator, make_token):
 
 def test_validate_token_unsupported_algorithm(validator, make_token):
     """HS256 forged with a key the gateway can see is rejected — the alg is not
-    on the RS-family allowlist (downgrade defense). Named to match the Phase 1.5
-    spec reference (REQ-1.5.5)."""
+    on the RS-family allowlist (downgrade defense)."""
     forged = jwt.encode(
         {"iss": ISSUER, "aud": AUDIENCE, "exp": int(time.time()) + 3600},
         "shared-secret",
@@ -74,7 +73,7 @@ def test_token_signed_by_wrong_key_rejected(validator, make_token):
         validator.validate(make_token(key=other))
 
 
-# --- JWKS rotation handling (Phase 4) --------------------------------------
+# --- JWKS rotation handling ----------------------------------------------------
 
 
 def _rotation_validator(monkeypatch, resolver):
@@ -123,7 +122,7 @@ def test_jwks_refresh_is_throttled(monkeypatch, make_token):
     refreshes = {"n": 0}
     real_new = v._new_client
     monkeypatch.setattr(
-        v, "_new_client", lambda: (refreshes.__setitem__("n", refreshes["n"] + 1) or real_new())
+        v, "_new_client", lambda: refreshes.__setitem__("n", refreshes["n"] + 1) or real_new()
     )
 
     with pytest.raises(TokenError):

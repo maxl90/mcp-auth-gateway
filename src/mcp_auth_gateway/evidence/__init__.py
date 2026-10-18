@@ -1,8 +1,7 @@
-"""Evidence generation — turn the audit log into GRC-framework-mapped evidence.
+"""Evidence: map what the audit log attests to compliance-framework controls.
 
-This is the pivot's product surface in miniature (ADR 007): the gateway is an
-evidence *sensor*; this package maps what it captured to compliance-framework
-controls, the way the audit consulting engagement and (later) the Governance
-Cloud do. It reads the locked v1.0 audit record (see
-``docs/architecture/audit-schema.md``) and never touches argument values.
+The gateway is a sensor; this package reads its records (never argument values),
+computes signals such as "actions are attributed" or "denials are logged", maps
+them to NIST AI RMF, EU AI Act and SOC 2 controls, and renders reports and
+signed attestation packs.
 """

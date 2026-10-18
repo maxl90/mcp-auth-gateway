@@ -26,7 +26,7 @@ groups:
   "00000000-0000-0000-0000-000000000002": # mcp-readonly (example id)
     allow: []
 
-# Step-up auth (Phase 2, ADR 006) — destructive tools require a fresh, strong
+# Step-up auth (RFC 9470) — destructive tools require a fresh, strong
 # auth assertion (an Entra authentication context in the token's `acrs` claim)
 # before the gateway forwards the call; otherwise it returns an RFC 9470
 # challenge and the client re-auths to Entra. Two accepted shapes:

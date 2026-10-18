@@ -1,12 +1,10 @@
-"""Schema-conformance telemetry on tool-call arguments (backlog item 11).
+"""Schema-conformance telemetry on tool-call arguments: log, never reject.
 
-Newer models invent schema fields — a tool call's contract can't be assumed
-reliable at the model layer. As a call transits, the gateway validates the
-arguments against the tool's pinned ``inputSchema`` and records the result in
-the audit record. **Log, never reject**: a non-conformant call is forwarded
-exactly as before (rejecting would be enforcement — ADR 007). The value is
-evidence about *agent behavior quality* per identity: which agents send calls
-that violate the contracts they were shown.
+Models invent schema fields, so as a call transits the gateway validates the
+arguments against the tool's pinned ``inputSchema`` and records the verdict. A
+non-conformant call is still forwarded unchanged (validation runs on a parsed
+copy that ``jsonschema`` never mutates); the value is evidence about each
+agent's behavior against the contracts it was shown.
 
 **Invariant (same as ``audit.structure``):** nothing returned here may contain
 an argument *value*. Violations are described only from the error's
@@ -15,9 +13,6 @@ expectation — never from ``err.instance`` or ``err.message``, both of which
 embed the offending value. Property *names* (the JSON path, unexpected keys)
 are shape, not data, matching the ``arg_keys`` precedent. Asserted
 adversarially in the tests.
-
-Validation runs on the already-parsed request copy and ``jsonschema`` never
-mutates the instance, so the forwarded body is untouched.
 """
 
 from __future__ import annotations
@@ -33,8 +28,7 @@ _MAX_UNEXPECTED_KEYS = 20
 
 
 def _expected(validator_value: Any) -> str:
-    """Compact, truncated rendering of the schema's expectation (schema-side
-    only — an ``enum``'s allowed values, a type name, a required-property list)."""
+    """Compact, truncated rendering of the schema's expectation (schema-side text only)."""
     try:
         text = json.dumps(validator_value, sort_keys=True, default=str)
     except (TypeError, ValueError):
@@ -45,8 +39,7 @@ def _expected(validator_value: Any) -> str:
 
 
 def _describe(err) -> dict:
-    """One value-free violation. Never touches ``err.message`` (it interpolates
-    the instance value)."""
+    """One value-free violation; never ``err.message``, which interpolates the instance value."""
     violation = {
         "path": err.json_path,
         "keyword": err.validator,
@@ -63,14 +56,11 @@ def _describe(err) -> dict:
 
 
 def check(schema: dict | None, arguments: Any) -> dict | None:
-    """The ``conformance`` block for a tool-call audit record, or ``None``.
+    """The ``conformance`` block for a tool-call record, or ``None`` with no pinned schema.
 
-    - No pinned schema for the tool → ``None`` (nothing to attest).
-    - Schema itself invalid/unsupported → ``{"schema_error": true}`` — the
-      telemetry degrades, the call is unaffected.
-    - Otherwise → ``schema_conformant`` plus value-free ``violations`` when
-      non-conformant. Absent arguments validate as ``{}`` — a tool that
-      requires arguments and received none is a real contract violation.
+    An invalid or unsupported schema yields ``{"schema_error": true}``; otherwise
+    ``schema_conformant`` plus value-free ``violations`` when false. Absent
+    arguments validate as ``{}``: a tool that requires arguments got none.
     """
     if not isinstance(schema, dict):
         return None

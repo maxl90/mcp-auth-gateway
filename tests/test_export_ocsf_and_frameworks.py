@@ -1,4 +1,4 @@
-"""OCSF export format (backlog C3) + EU AI Act / SOC 2 framework maps (C2)."""
+"""OCSF export format + EU AI Act / SOC 2 framework maps."""
 
 from __future__ import annotations
 
@@ -20,30 +20,63 @@ def _reset_chain():
 def _seed(tmp_path, monkeypatch):
     log = tmp_path / "audit.log"
     monkeypatch.setattr(writer.settings, "audit_log_path", str(log))
-    claims = {"oid": "u1", "preferred_username": "a@b.com", "tid": "t1",
-              "azp": "agent-1", "app_displayname": "Agent One"}
+    claims = {
+        "oid": "u1",
+        "preferred_username": "a@b.com",
+        "tid": "t1",
+        "azp": "agent-1",
+        "app_displayname": "Agent One",
+    }
     writer.record(
-        outcome="allowed", tool="postgres__execute_sql", correlation_id="c1",
-        upstream="postgres", claims=claims,
-        structure={"kind": "sql", "tables": ["patients"], "touches_pii": True,
-                   "pii_columns": ["mrn"], "columns": ["mrn"], "statement_types": ["SELECT"]},
-        manifest={"sha256": "aa" * 32},
-        conformance={"schema_conformant": True},
-        channel={"dpop_jkt": "jkt-1", "edge_client_cert_serial": "01"},
+        writer.AuditEvent(
+            outcome="allowed",
+            tool="postgres__execute_sql",
+            correlation_id="c1",
+            upstream="postgres",
+            claims=claims,
+            structure={
+                "kind": "sql",
+                "tables": ["patients"],
+                "touches_pii": True,
+                "pii_columns": ["mrn"],
+                "columns": ["mrn"],
+                "statement_types": ["SELECT"],
+            },
+            manifest={"sha256": "aa" * 32},
+            conformance={"schema_conformant": True},
+            channel={"dpop_jkt": "jkt-1", "edge_client_cert_serial": "01"},
+        )
     )
     writer.record(
-        outcome="denied", tool="postgres__delete_table", correlation_id="c2",
-        upstream="postgres", claims=claims, reason="tool not permitted",
+        writer.AuditEvent(
+            outcome="denied",
+            tool="postgres__delete_table",
+            correlation_id="c2",
+            upstream="postgres",
+            claims=claims,
+            reason="tool not permitted",
+        )
     )
     writer.record(
-        outcome="manifest_drift", tool="postgres__execute_sql", correlation_id="c3",
-        upstream="postgres", claims=claims,
-        reason="tool manifest changed since the pinned baseline",
-        manifest={"sha256": "bb" * 32, "previous_sha256": "aa" * 32},
+        writer.AuditEvent(
+            outcome="manifest_drift",
+            tool="postgres__execute_sql",
+            correlation_id="c3",
+            upstream="postgres",
+            claims=claims,
+            reason="tool manifest changed since the pinned baseline",
+            manifest={"sha256": "bb" * 32, "previous_sha256": "aa" * 32},
+        )
     )
     writer.record(
-        outcome="step_up_required", tool="postgres__execute_sql", correlation_id="c4",
-        upstream="postgres", claims=claims, reason="step-up not satisfied: missing",
+        writer.AuditEvent(
+            outcome="step_up_required",
+            tool="postgres__execute_sql",
+            correlation_id="c4",
+            upstream="postgres",
+            claims=claims,
+            reason="step-up not satisfied: missing",
+        )
     )
     return log
 

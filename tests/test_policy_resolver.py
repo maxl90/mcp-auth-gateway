@@ -54,8 +54,8 @@ def test_allowed_set_is_union_of_groups(policy):
 
 
 def test_destructive_flagged_but_not_enforced(policy):
-    assert policy.is_destructive("execute_sql")
-    assert not policy.is_destructive("list_schemas")
+    assert policy.step_up_for("execute_sql") is not None
+    assert policy.step_up_for("list_schemas") is None
 
 
 def test_missing_policy_file_fails_closed(tmp_path):

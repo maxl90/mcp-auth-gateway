@@ -1,34 +1,11 @@
-"""DPoP (RFC 9449) proof validation — sender-constrained access tokens.
+"""DPoP (RFC 9449): proof-of-possession for sender-constrained access tokens.
 
-The gateway is the *resource server* in the DPoP model: the authorization
-server binds an access token to the client's key pair by putting the key's
-JWK thumbprint (RFC 7638) in the token's ``cnf.jkt`` claim; the client then
-proves possession on every request with a ``DPoP`` header — a short-lived JWT
-signed by that key over the request method + URI. A token stolen at any hop
-(proxy logs, TLS middlebox, compromised client store) is useless without the
-private key.
-
-Modes (``DPOP_MODE``):
-
-- ``off`` — proofs ignored entirely.
-- ``if_present`` (default) — a token carrying ``cnf.jkt`` MUST arrive under the
-  ``DPoP`` authorization scheme with a valid, bound proof; tokens without
-  ``cnf`` keep working as plain bearer tokens. This is the right posture while
-  the authorization server (Entra today) does not broadly issue DPoP-bound
-  tokens: binding is enforced the moment the AS provides it.
-- ``required`` — additionally rejects tokens that carry no ``cnf.jkt`` at all.
-
-Resource-server checks per RFC 9449 §4.3: exactly one ``DPoP`` header; proof
-JWT has ``typ: dpop+jwt``, an allowlisted asymmetric ``alg``, and an embedded
-*public* ``jwk`` that verifies the signature; ``htm``/``htu`` match the request
-(``htu`` compared against the gateway's external base URL when configured —
-the proof names the public URL, not the address behind the proxy); ``iat``
-within an acceptance window; ``ath`` equals the SHA-256 of the presented
-access token; ``jti`` not seen before (in-memory replay cache, single-replica
-per ADR 004); and the proof key's thumbprint equals the token's ``cnf.jkt``.
-
-Server-provided nonces (§8) are not implemented in v1 — the ``iat`` window +
-``jti`` replay cache bound proof lifetime instead. (ADR 008.)
+The authorization server binds a token to the client's key by putting the key's
+JWK thumbprint in ``cnf.jkt``; the client proves possession on every request with
+a ``DPoP`` header, a short JWT signed by that key over the method and URI.
+``DPOP_MODE`` is ``off``, ``if_present`` (bound tokens must prove; bearer tokens
+still work) or ``required``. No server nonces (§8): the ``iat`` window and the
+``jti`` replay cache bound a proof's lifetime instead.
 """
 
 from __future__ import annotations
@@ -37,7 +14,6 @@ import base64
 import hashlib
 import json
 import time
-from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import jwt as pyjwt
@@ -81,17 +57,14 @@ def jwk_thumbprint(jwk: dict) -> str:
     if members is None:
         raise DpopError(f"unsupported jwk kty: {jwk.get('kty')!r}")
     try:
-        canonical = json.dumps(
-            {m: jwk[m] for m in members}, sort_keys=True, separators=(",", ":")
-        )
+        canonical = json.dumps({m: jwk[m] for m in members}, sort_keys=True, separators=(",", ":"))
     except KeyError as exc:
         raise DpopError(f"jwk missing required member {exc}") from exc
     return _b64url(hashlib.sha256(canonical.encode("utf-8")).digest())
 
 
 def _normalize_htu(url: str) -> str:
-    """§4.3: compare ``htu`` without query and fragment. Scheme/host casefold;
-    a single trailing slash is tolerated (clients differ on it)."""
+    """Comparison form of an ``htu`` (§4.3): no query/fragment, casefolded scheme and host."""
     parts = urlsplit(url)
     path = parts.path or "/"
     if len(path) > 1 and path.endswith("/"):
@@ -110,17 +83,14 @@ def expected_htus(request_url: str, path: str) -> set[str]:
     return accepted
 
 
-@dataclass
 class _ReplayCache:
-    """Seen ``jti`` values within the acceptance window. In-memory and
-    single-replica (ADR 004); size-capped so a proof flood can't grow it
-    unboundedly — when full, the oldest entries are pruned first."""
+    """Seen ``jti`` values within the acceptance window. In-memory and size-capped,
+    so a proof flood cannot grow it without bound; when full, expired entries go
+    first, then the oldest."""
 
-    max_entries: int = 100_000
-    _seen: dict[str, float] = None  # jti -> expiry (monotonic)
-
-    def __post_init__(self) -> None:
-        self._seen = {}
+    def __init__(self, max_entries: int = 100_000) -> None:
+        self.max_entries = max_entries
+        self._seen: dict[str, float] = {}  # jti -> expiry (monotonic)
 
     def check_and_store(self, jti: str, ttl: float) -> bool:
         """False if ``jti`` was already presented (replay); True otherwise."""
@@ -141,16 +111,9 @@ class _ReplayCache:
 _replay = _ReplayCache()
 
 
-def validate_proof(
-    proof: str,
-    *,
-    method: str,
-    accepted_htus: set[str],
-    access_token: str,
-    cnf_jkt: str,
-) -> str:
-    """Validate one DPoP proof against the request + bound token; return the
-    proof key's thumbprint (== ``cnf_jkt``) on success, raise DpopError else."""
+def _parse_header(proof: str) -> tuple[str, dict, object]:
+    """The proof's ``alg``, its embedded public ``jwk``, and the key object, after
+    the header checks: ``typ``, an allowlisted ``alg``, no private-key members."""
     try:
         header = pyjwt.get_unverified_header(proof)
     except pyjwt.InvalidTokenError as exc:
@@ -171,9 +134,13 @@ def validate_proof(
         key = pyjwt.PyJWK(dict(jwk, alg=alg)).key
     except Exception as exc:  # noqa: BLE001 — any unusable key → invalid proof
         raise DpopError(f"proof jwk is not a usable public key: {exc}") from exc
+    return alg, jwk, key
 
+
+def _verify_claims(proof: str, key: object, alg: str) -> dict:
+    """The proof's claims once its signature verifies under its own embedded key."""
     try:
-        claims = pyjwt.decode(
+        return pyjwt.decode(
             proof,
             key,
             algorithms=[alg],
@@ -182,15 +149,18 @@ def validate_proof(
     except pyjwt.InvalidTokenError as exc:
         raise DpopError(f"proof signature/claims invalid: {exc}") from exc
 
+
+def _check_binding(claims: dict, method: str, accepted_htus: set[str], access_token: str) -> None:
+    """The proof names this request (``htm``, ``htu``), is fresh (``iat``), and covers
+    the presented token (``ath``)."""
     if claims["htm"] != method.upper():
         raise DpopError(f"proof htm {claims['htm']!r} does not match request method")
     if _normalize_htu(str(claims["htu"])) not in accepted_htus:
         raise DpopError("proof htu does not match this request URI")
 
-    now = time.time()
     window = settings.dpop_iat_window
     iat = claims["iat"]
-    if not isinstance(iat, (int, float)) or abs(now - iat) > window:
+    if not isinstance(iat, (int, float)) or abs(time.time() - iat) > window:
         raise DpopError(f"proof iat outside the ±{window}s acceptance window")
 
     # §4.3 item 12: when presented to a protected resource with an access
@@ -199,12 +169,27 @@ def validate_proof(
     if claims.get("ath") != expected_ath:
         raise DpopError("proof ath does not match the presented access token")
 
+
+def validate_proof(
+    proof: str,
+    *,
+    method: str,
+    accepted_htus: set[str],
+    access_token: str,
+    cnf_jkt: str,
+) -> str:
+    """Validate one DPoP proof against the request + bound token; return the
+    proof key's thumbprint (== ``cnf_jkt``) on success, raise DpopError else."""
+    alg, jwk, key = _parse_header(proof)
+    claims = _verify_claims(proof, key, alg)
+    _check_binding(claims, method, accepted_htus, access_token)
+
     thumbprint = jwk_thumbprint(jwk)
     if thumbprint != cnf_jkt:
         raise DpopError("proof key does not match the token's cnf.jkt binding")
 
-    jti = str(claims["jti"])
-    if not _replay.check_and_store(jti, ttl=window * 2):
+    # Replay goes last, so a proof rejected above never consumes its jti.
+    if not _replay.check_and_store(str(claims["jti"]), ttl=settings.dpop_iat_window * 2):
         raise DpopError("proof jti already used (replay)")
 
     return thumbprint
@@ -219,17 +204,14 @@ def enforce(
     method: str,
     accepted_htus: set[str],
 ) -> str | None:
-    """Apply the configured DPoP mode to one authenticated request.
+    """Apply ``DPOP_MODE`` to one authenticated request.
 
-    Returns the bound key thumbprint (for the audit record) or ``None`` when
-    the token is unbound and the mode allows bearer use. Raises DpopError with
-    the OAuth error code for the 401 challenge otherwise.
+    Returns the bound key's thumbprint for the audit record, or ``None`` when the
+    token is unbound and bearer use is allowed. Raises :class:`DpopError` otherwise.
     """
     mode = settings.dpop_mode
     if mode == "off":
         return None
-    if mode not in ("if_present", "required"):
-        raise DpopError(f"invalid DPOP_MODE {mode!r}", error="server_error")
 
     cnf = claims.get("cnf")
     cnf_jkt = cnf.get("jkt") if isinstance(cnf, dict) else None

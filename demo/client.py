@@ -107,7 +107,7 @@ def _build_token_cache() -> PersistedTokenCache:
 def build_claims_challenge(acr: str) -> str:
     """The Entra claims-challenge JSON that requests an authentication context.
 
-    Passed to MSAL as ``claims_challenge`` (Phase 2 step-up, ADR 006). It asks
+    Passed to MSAL as ``claims_challenge``. It asks
     Entra to return a token whose ``acrs`` contains ``acr``, which Entra will
     only issue after the Conditional Access policy bound to that context (MFA /
     phishing-resistant / compliant device) is satisfied. This is the client

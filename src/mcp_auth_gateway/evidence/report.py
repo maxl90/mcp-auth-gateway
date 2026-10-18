@@ -1,20 +1,16 @@
-"""Generate a GRC-framework-mapped evidence report from the audit log.
+"""Render a framework-mapped evidence report from the audit log.
 
-Reads the locked v1.0 audit log, computes evidence signals, maps them to a
-framework's controls, and renders a human-readable Markdown report plus a
-machine-readable JSON bundle. This is the audit-engagement deliverable in
-miniature and a preview of the Governance Cloud's output (ADR 007).
-
-CLI (installed as ``mcp-auth-gateway-evidence-report``)::
+Computes the evidence signals, maps them to a framework's controls, and renders
+a Markdown report plus a machine-readable JSON bundle.
 
     mcp-auth-gateway-evidence-report [audit_path] [framework] [out.md]
-    # audit_path defaults to AUDIT_LOG_PATH; framework defaults to nist-ai-rmf
-    # (a built-in name or a path to a custom YAML map); out.md → stdout if omitted.
-    # A JSON bundle is written next to out.md (out.json) when out is given.
+    # framework: a built-in name (default nist-ai-rmf) or a path to a custom YAML
+    # map; with out.md given, out.json is written beside it.
 """
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import json
 import sys
@@ -39,13 +35,11 @@ def _status(control_signals: list[str], flags: dict[str, bool]) -> tuple[str, li
     return _PARTIAL, present, missing
 
 
-def build_bundle_from(
-    sig: signals_mod.Signals, framework: str, audit_path: str | Path
-) -> dict:
+def build_bundle_from(sig: signals_mod.Signals, framework: str, audit_path: str | Path) -> dict:
     """Assemble the evidence bundle from already-computed signals.
 
-    Seam for callers that aggregate a *windowed* record subset (attestation
-    packs) while carrying the full-log chain verdict on ``sig``.
+    Attestation packs call this with a windowed subset's signals that still carry
+    the full-log chain verdict.
     """
     fw = frameworks.load(framework)
     flags = sig.flags()
@@ -148,11 +142,14 @@ def main() -> None:
     with contextlib.suppress(AttributeError, ValueError):
         sys.stdout.reconfigure(encoding="utf-8")
 
-    audit_path = sys.argv[1] if len(sys.argv) > 1 else settings.audit_log_path
-    framework = sys.argv[2] if len(sys.argv) > 2 else "nist-ai-rmf"
-    out = sys.argv[3] if len(sys.argv) > 3 else None
+    ap = argparse.ArgumentParser(description="Render an evidence report from an audit log")
+    ap.add_argument("audit_path", nargs="?", default=settings.audit_log_path)
+    ap.add_argument("framework", nargs="?", default="nist-ai-rmf")
+    ap.add_argument("out", nargs="?", help="write Markdown here, and JSON beside it")
+    args = ap.parse_args()
+    out = args.out
 
-    bundle = build_bundle(audit_path, framework)
+    bundle = build_bundle(args.audit_path, args.framework)
     md = render_markdown(bundle)
 
     if out:

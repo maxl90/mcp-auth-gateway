@@ -3,7 +3,7 @@
 Unlike the rest of the suite (respx-mocked, in-process), this drives a LIVE
 upstream to verify a property that can't be mocked — that mcp-proxy + the stdio
 MCP server handle many sessions *in parallel* without cross-talk. It underwrites
-the multi-user story (see docs: multi-upstream-aggregation.md, Concurrency).
+the multi-user story.
 
 It SKIPS when no upstream is reachable, so `pytest` stays green with the stack
 down. Targets the demo Postgres upstream (uses `execute_sql` / `pg_sleep`).
@@ -30,15 +30,27 @@ def _run(coro):
 
 
 async def _open_session(client: httpx.AsyncClient) -> str:
-    r = await client.post(UPSTREAM, headers=_H, json={
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"protocolVersion": "2025-03-26", "capabilities": {},
-                   "clientInfo": {"name": "probe", "version": "0"}},
-    })
+    r = await client.post(
+        UPSTREAM,
+        headers=_H,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "probe", "version": "0"},
+            },
+        },
+    )
     r.raise_for_status()
     sid = r.headers["mcp-session-id"]
-    await client.post(UPSTREAM, headers={**_H, "mcp-session-id": sid},
-                      json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+    await client.post(
+        UPSTREAM,
+        headers={**_H, "mcp-session-id": sid},
+        json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+    )
     return sid
 
 
@@ -46,10 +58,16 @@ async def _sql(client: httpx.AsyncClient, sid: str | None, sql: str, rid: int) -
     headers = dict(_H)
     if sid:
         headers["mcp-session-id"] = sid
-    return await client.post(UPSTREAM, headers=headers, json={
-        "jsonrpc": "2.0", "id": rid, "method": "tools/call",
-        "params": {"name": "execute_sql", "arguments": {"sql": sql}},
-    })
+    return await client.post(
+        UPSTREAM,
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": rid,
+            "method": "tools/call",
+            "params": {"name": "execute_sql", "arguments": {"sql": sql}},
+        },
+    )
 
 
 @pytest.fixture(scope="module")
@@ -69,6 +87,7 @@ def live_upstream() -> str:
 
 def test_concurrent_sessions_are_isolated(live_upstream):
     """Two clients get distinct sessions; concurrent calls don't cross-contaminate."""
+
     async def go():
         async with httpx.AsyncClient(timeout=30) as c:
             a, b = await _open_session(c), await _open_session(c)
@@ -85,14 +104,15 @@ def test_concurrent_sessions_are_isolated(live_upstream):
 
 def test_concurrent_sessions_run_in_parallel(live_upstream):
     """4 concurrent 1s sleeps finish well under the ~4s they'd take if serialized."""
+
     async def go():
         async with httpx.AsyncClient(timeout=30) as c:
             a, b = await _open_session(c), await _open_session(c)
             sids = [a, b, a, b]
             t0 = time.perf_counter()
-            results = await asyncio.gather(*[
-                _sql(c, s, "SELECT pg_sleep(1)", 20 + i) for i, s in enumerate(sids)
-            ])
+            results = await asyncio.gather(
+                *[_sql(c, s, "SELECT pg_sleep(1)", 20 + i) for i, s in enumerate(sids)]
+            )
             elapsed = time.perf_counter() - t0
             assert all(r.status_code == 200 for r in results)
             assert elapsed < 3.0, (
@@ -105,6 +125,7 @@ def test_concurrent_sessions_run_in_parallel(live_upstream):
 
 def test_session_id_is_enforced(live_upstream):
     """A bogus or missing session id is rejected, not silently accepted."""
+
     async def go():
         async with httpx.AsyncClient(timeout=10) as c:
             bogus = await _sql(c, "0" * 32, "SELECT 1", 30)
