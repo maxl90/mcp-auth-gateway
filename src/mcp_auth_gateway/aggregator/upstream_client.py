@@ -18,8 +18,9 @@ from typing import Any
 import httpx
 
 from .. import __version__, jsonrpc
+from ..auth.claims import Claims
 from ..config import settings
-from ..http_util import ResponseTooLarge, read_capped
+from ..http_util import BodyTooLarge, read_capped
 from ..upstreams import Upstream
 from .registry import UpstreamSession
 
@@ -68,7 +69,7 @@ class UpstreamRequest:
         return self.session.session_id if self.session else None
 
 
-def _select_response(candidates: list[object], upstream: str, request_id: int) -> dict:
+def _select_response(candidates: list[object], upstream: str, request_id: int) -> dict[str, Any]:
     """The JSON-RPC response to ``request_id`` among parsed messages.
 
     Interleaved notifications are dropped. A response carrying another id answers a
@@ -89,7 +90,9 @@ def _select_response(candidates: list[object], upstream: str, request_id: int) -
     raise UpstreamError(upstream, "no JSON-RPC response message in body")
 
 
-def _extract_response(raw: bytes, content_type: str | None, upstream: str, request_id: int) -> dict:
+def _extract_response(
+    raw: bytes, content_type: str | None, upstream: str, request_id: int
+) -> dict[str, Any]:
     """The JSON-RPC response to ``request_id`` in a JSON or SSE body."""
     ct = (content_type or "").lower()
     if "application/json" not in ct and "text/event-stream" not in ct:
@@ -113,25 +116,26 @@ def _headers(session_id: str | None, extra: dict[str, str] | None = None) -> dic
     return headers
 
 
-def attribution_headers(correlation_id: str, claims: dict | None) -> dict[str, str]:
+def attribution_headers(correlation_id: str, claims: Claims | None) -> dict[str, str]:
     """The audit metadata a ``tools/call`` may carry upstream: the record's correlation
     id and the human's ``oid``; never a token, never an argument. Empty unless
     ``forward_attribution_headers`` is on; an app-only token sends the id alone."""
     if not settings.forward_attribution_headers:
         return {}
     headers = {"x-mcp-gateway-correlation-id": correlation_id}
-    oid = (claims or {}).get("oid")
-    if isinstance(oid, str) and oid and (claims or {}).get("idtyp") != "app":
+    oid = claims.get("oid") if claims else None
+    if isinstance(oid, str) and oid and claims and claims.get("idtyp") != "app":
         headers["x-mcp-gateway-on-behalf-of"] = oid
     return headers
 
 
 async def _post(
     req: UpstreamRequest,
-    payload: dict,
+    payload: dict[str, Any],
     timeout: httpx.Timeout,
     extra_headers: dict[str, str] | None = None,
-) -> httpx.Response:
+) -> tuple[httpx.Response, bytes]:
+    """POST ``payload`` and return the closed response with its body, read under the cap."""
     try:
         response = await req.client.send(
             req.client.build_request(
@@ -147,45 +151,42 @@ async def _post(
         raise UpstreamError(req.upstream.name, f"transport failure: {exc}") from exc
 
     try:
-        body = await read_capped(response, settings.max_upstream_response_bytes)
-    except ResponseTooLarge as exc:
+        body = await read_capped(response.aiter_bytes(), settings.max_upstream_response_bytes)
+    except BodyTooLarge as exc:
         await response.aclose()
         raise UpstreamError(req.upstream.name, f"{exc}; aborted") from exc
     except httpx.HTTPError as exc:
         await response.aclose()
         raise UpstreamError(req.upstream.name, f"transport failure while reading: {exc}") from exc
-    response._content = body  # noqa: SLF001 — set the buffered body on the streamed response
     await response.aclose()
-    return response
+    return response, body
 
 
 async def rpc(
     req: UpstreamRequest,
     method: str,
-    params: dict | None = None,
+    params: dict[str, Any] | None = None,
     *,
     timeout: httpx.Timeout = _CONTROL_TIMEOUT,
     extra_headers: dict[str, str] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """One request/response RPC on an established upstream session. Returns the
     JSON-RPC response message (which may itself be an ``error`` — relayed, not
     raised)."""
     if req.session is None:
         raise UpstreamError(req.upstream.name, f"{method} before initialize")
     request_id = req.session.next_request_id()
-    payload: dict = {"jsonrpc": "2.0", "id": request_id, "method": method}
+    payload: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
     if params is not None:
         payload["params"] = params
-    resp = await _post(req, payload, timeout, extra_headers)
+    resp, body = await _post(req, payload, timeout, extra_headers)
     if resp.status_code == 404 and req.session_id is not None:
         # The upstream dropped our session (expiry, upstream restart). Signal a
         # reconnect rather than a hard failure.
         raise UpstreamSessionExpired(req.upstream.name, f"session expired on {method}")
     if resp.status_code >= 400:
         raise UpstreamError(req.upstream.name, f"HTTP {resp.status_code} on {method}")
-    return _extract_response(
-        resp.content, resp.headers.get("content-type"), req.upstream.name, request_id
-    )
+    return _extract_response(body, resp.headers.get("content-type"), req.upstream.name, request_id)
 
 
 async def call_tool(
@@ -194,11 +195,11 @@ async def call_tool(
     tool: str,
     arguments: Any,
     attribution: dict[str, str] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Invoke ``tool`` (the upstream's *original*, un-namespaced name) and return
     the JSON-RPC response with the caller's original request id restored.
     ``attribution`` is :func:`attribution_headers`' output (empty when off)."""
-    params: dict = {"name": tool}
+    params: dict[str, Any] = {"name": tool}
     if arguments is not None:
         params["arguments"] = arguments
     response = await rpc(
@@ -221,24 +222,20 @@ async def initialize_session(client: httpx.AsyncClient, upstream: Upstream) -> U
             "clientInfo": {"name": "mcp-auth-gateway", "version": __version__},
         },
     }
-    resp = await _post(UpstreamRequest(client, upstream), payload, _CONTROL_TIMEOUT)
+    resp, body = await _post(UpstreamRequest(client, upstream), payload, _CONTROL_TIMEOUT)
     if resp.status_code >= 400:
         raise UpstreamError(upstream.name, f"HTTP {resp.status_code} on initialize")
     message = _extract_response(
-        resp.content, resp.headers.get("content-type"), upstream.name, _INITIALIZE_ID
+        body, resp.headers.get("content-type"), upstream.name, _INITIALIZE_ID
     )
     if "error" in message:
         raise UpstreamError(upstream.name, f"initialize error: {message['error']}")
 
-    session = UpstreamSession(
-        upstream=upstream.name,
-        url=upstream.url,
-        session_id=resp.headers.get("mcp-session-id"),
-    )
+    session = UpstreamSession(session_id=resp.headers.get("mcp-session-id"))
 
     # Complete the handshake. A 4xx here is fatal (the session never became
     # usable); transport errors already raise in _post.
-    notified = await _post(
+    notified, _ = await _post(
         UpstreamRequest(client, upstream, session),
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
         _CONTROL_TIMEOUT,

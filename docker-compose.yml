@@ -18,6 +18,9 @@ services:
     environment:
       UPSTREAM_MCP_URL: http://mcp-upstream:9000/mcp   # service-name DNS on the compose network
       POLICY_PATH: /app/policy.generated.yaml
+      # A step-up (acrs c1) stays fresh for an hour here; the code default is 300 s.
+      # Keep it equal to the sign-in frequency on the Entra policy bound to c1.
+      STEP_UP_MAX_AGE: "3600"
     volumes:
       - ./policy.generated.yaml:/app/policy.generated.yaml:ro   # group->tool RBAC map (gitignored)
     ports:

@@ -4,25 +4,16 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from mcp_auth_gateway.audit import writer
 from mcp_auth_gateway.evidence import report, signals
 
 
-@pytest.fixture(autouse=True)
-def _reset_chain():
-    writer._chain["path"] = None
-    writer._chain["last_hash"] = None
-    yield
-
-
-def _seed_log(path, monkeypatch):
+def _seed_log(path) -> writer.AuditLog:
     """Write a small mix of records: an attributed allowed SQL call touching PII,
     a denial, and a step-up challenge."""
-    monkeypatch.setattr(writer.settings, "audit_log_path", str(path))
+    audit_log = writer.AuditLog(path)
     agent_human = {"oid": "human-1", "preferred_username": "a@b.com", "azp": "agent-1", "tid": "t1"}
-    writer.record(
+    audit_log.record(
         writer.AuditEvent(
             outcome="allowed",
             tool="postgres__list_schemas",
@@ -32,7 +23,7 @@ def _seed_log(path, monkeypatch):
             structure={"kind": "generic", "arg_keys": []},
         )
     )
-    writer.record(
+    audit_log.record(
         writer.AuditEvent(
             outcome="denied",
             tool="github__delete_file",
@@ -42,7 +33,7 @@ def _seed_log(path, monkeypatch):
             reason="not permitted",
         )
     )
-    writer.record(
+    audit_log.record(
         writer.AuditEvent(
             outcome="step_up_required",
             tool="postgres__execute_sql",
@@ -59,11 +50,12 @@ def _seed_log(path, monkeypatch):
             },
         )
     )
+    return audit_log
 
 
-def test_signals_computed(tmp_path, monkeypatch):
+def test_signals_computed(tmp_path):
     log = tmp_path / "audit.log"
-    _seed_log(log, monkeypatch)
+    _seed_log(log)
     s = signals.compute(log)
     assert s.total_records == 3
     assert s.outcomes == {"allowed": 1, "denied": 1, "step_up_required": 1}
@@ -80,9 +72,9 @@ def test_signals_computed(tmp_path, monkeypatch):
     assert flags["tamper_evident"]
 
 
-def test_bundle_attests_controls(tmp_path, monkeypatch):
+def test_bundle_attests_controls(tmp_path):
     log = tmp_path / "audit.log"
-    _seed_log(log, monkeypatch)
+    _seed_log(log)
     bundle = report.build_bundle(log, "nist-ai-rmf")
     assert bundle["framework"] == "NIST AI RMF 1.0"
     by_id = {c["id"]: c for c in bundle["controls"]}
@@ -98,9 +90,9 @@ def test_empty_log_gives_no_evidence(tmp_path):
     assert all(c["status"] == "NO EVIDENCE" for c in bundle["controls"])
 
 
-def test_broken_chain_surfaces_in_report(tmp_path, monkeypatch):
+def test_broken_chain_surfaces_in_report(tmp_path):
     log = tmp_path / "audit.log"
-    _seed_log(log, monkeypatch)
+    _seed_log(log)
     lines = log.read_text(encoding="utf-8").splitlines()
     rec = json.loads(lines[0])
     rec["tool"] = "tampered"
@@ -114,10 +106,37 @@ def test_broken_chain_surfaces_in_report(tmp_path, monkeypatch):
     assert govern43["status"] != "ATTESTED"
 
 
-def test_markdown_renders(tmp_path, monkeypatch):
+def test_markdown_renders(tmp_path):
     log = tmp_path / "audit.log"
-    _seed_log(log, monkeypatch)
+    _seed_log(log)
     md = report.render_markdown(report.build_bundle(log, "nist-ai-rmf"))
     assert "# Agent Governance Evidence Report" in md
     assert "GOVERN 1.5" in md
     assert "Tamper-evidence:" in md
+
+
+def test_bundle_carries_attribution_conformance_and_chain_detail(tmp_path):
+    log = tmp_path / "audit.log"
+    audit_log = _seed_log(log)
+    audit_log.record(
+        writer.AuditEvent(
+            outcome="allowed",
+            tool="postgres__execute_sql",
+            correlation_id="c4",
+            claims={"azp": "agent-1", "idtyp": "app"},  # app-only: an agent, no human
+            conformance={"schema_conformant": False, "violations": []},
+        )
+    )
+    bundle = report.build_bundle(log, "nist-ai-rmf")
+    sig = bundle["signals"]
+    assert (sig["records_with_agent"], sig["records_with_human"]) == (4, 3)
+    assert (sig["schema_checked_records"], sig["schema_violation_records"]) == (1, 1)
+    assert bundle["coverage"]["chain_detail"] == "chain intact"
+
+    lines = log.read_text(encoding="utf-8").splitlines()
+    rec = json.loads(lines[1])
+    rec["outcome"] = "allowed"
+    lines[1] = json.dumps(rec, separators=(",", ":"))
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    broken = report.build_bundle(log, "nist-ai-rmf")
+    assert broken["coverage"]["chain_detail"].startswith("line 2:")

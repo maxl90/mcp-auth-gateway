@@ -12,6 +12,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from .claims import Claims
 from .policy_resolver import StepUpRequirement
 
 
@@ -21,7 +22,7 @@ class StepUpResult:
     reason: str  # short machine-ish reason, for the audit record
 
 
-def _acrs(claims: dict) -> list[str]:
+def _acrs(claims: Claims) -> list[str]:
     """The satisfied authentication-context ids; Entra sends an array, a scalar is tolerated."""
     raw = claims.get("acrs")
     if isinstance(raw, str):
@@ -32,7 +33,7 @@ def _acrs(claims: dict) -> list[str]:
 
 
 def evaluate(
-    claims: dict, requirement: StepUpRequirement, *, now: float | None = None
+    claims: Claims, requirement: StepUpRequirement, *, now: float | None = None
 ) -> StepUpResult:
     """Decide whether ``claims`` satisfy ``requirement``.
 

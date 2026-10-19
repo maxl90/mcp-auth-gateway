@@ -7,11 +7,12 @@ tool-level RBAC, and writes a hash-chained, argument-free audit log.
 client (agent)                  mcp-auth-gateway                            upstream MCP server(s)
 --------------                  ----------------                            ----------------------
 POST /mcp ------------------->  1. validate the token against the IdP's JWKS
-Authorization: Bearer <jwt>     2. tools/call? RBAC, then step-up, then DPoP
-                                3. write the audit record (no argument values)
-                                4. strip Authorization, forward ---------->  the server reaches its
+Authorization: Bearer <jwt>     2. key-bound token? check its DPoP proof
+                                3. tools/call? RBAC, then step-up
+                                4. write the audit record (no argument values)
+                                5. strip the credentials, forward -------->  the server reaches its
                                                                              resource with its OWN
-          <-------------------  5. tools/list answers filtered <----------  credential
+          <-------------------  6. tools/list answers filtered <----------  credential
                                    to the caller's permitted tools
 ```
 
@@ -47,13 +48,14 @@ Requires Docker, [`uv`](https://docs.astral.sh/uv/), and a development Entra ten
 
 ```sh
 # 1. Provision a dev tenant once: an app, two security groups, two test users.
-#    Writes .env.generated (issuer, audience, JWKS) and policy.generated.yaml.
+#    Then in Entra: auth context "c1", a CA policy requiring MFA for it, the auth_time claim.
 pwsh infra/provision-entra.ps1
 
 # 2. Bring up the governed stack: gateway :8080 -> mcp-upstream :9000 -> Postgres.
 docker compose up -d --build
 
-# 3. Call a tool as the allowed (analyst) user: device-code login, then a SELECT.
+# 3. Call a tool as the allowed (analyst) user. execute_sql is destructive, so the first
+#    call is step-up challenged (RFC 9470); the client re-signs in with the claims challenge.
 uv run --extra demo python demo/client.py
 
 # 4. The same call as the denied (readonly) user is 403 and never reaches the database.
@@ -76,7 +78,7 @@ curl -i -X POST http://localhost:8080/mcp -d '{"jsonrpc":"2.0","id":1,"method":"
 | Feature | Standard | Settings | Code |
 |---|---|---|---|
 | Token validation against the tenant JWKS (RS256/384/512 only, key rotation), then termination: the token is never forwarded | OAuth 2.1 | `GATEWAY_ISSUER`, `GATEWAY_AUDIENCE`, `GATEWAY_JWKS_URL` | `auth/token_validator.py`, `proxy.py` |
-| Protected Resource Metadata and the `resource_metadata` pointer on every 401 | RFC 9728, 8707, 9207 | `GATEWAY_RESOURCE_URL`, `GATEWAY_EXTERNAL_BASE_URL` | `auth/discovery.py` |
+| Protected Resource Metadata and the `resource_metadata` pointer on every 401 | RFC 9728, 8707 | `GATEWAY_RESOURCE_URL`, `GATEWAY_EXTERNAL_BASE_URL` | `auth/discovery.py` |
 | Tool-level RBAC: Entra groups to allowed tools; a disallowed `tools/call` is 403 and not forwarded | | `POLICY_PATH` | `auth/policy_resolver.py`, `auth/enforce.py` |
 | `tools/list` filtered to the caller's tools (JSON and SSE bodies) | | `POLICY_PATH` | `tools_filter.py` |
 | Step-up: destructive tools need a fresh Entra authentication context or get a challenge | RFC 9470 | `STEP_UP_DEFAULT_ACR`, `STEP_UP_MAX_AGE` | `auth/step_up.py` |
@@ -95,7 +97,7 @@ field name in upper case.
 |---|---|---|
 | `UPSTREAM_MCP_URL` | `http://localhost:9000/mcp` | The upstream MCP server's Streamable HTTP endpoint in single-upstream mode. |
 | `UPSTREAMS_CONFIG_PATH` | empty | Path to an `upstreams.yaml`; setting it switches to aggregation mode. |
-| `MAX_UPSTREAM_RESPONSE_BYTES` | `10485760` | Cap on any upstream response the gateway buffers (the `tools/list` filter and aggregator RPCs); streaming passthrough is unaffected. `0` disables it. |
+| `MAX_UPSTREAM_RESPONSE_BYTES` | `10485760` | Cap on any body the gateway buffers. A request body is read before authentication, and over the cap it is a 413. An upstream response the gateway parses is refused over the cap: a filtered `tools/list` is a 502, an aggregated `tools/call` gets a JSON-RPC error, and an aggregated `tools/list` leaves that upstream out as `degraded`. Streamed upstream responses are not capped. `0` disables it. |
 | `FORWARD_ATTRIBUTION_HEADERS` | `false` | In aggregation mode, send `X-MCP-Gateway-Correlation-Id` and `X-MCP-Gateway-On-Behalf-Of` with each `tools/call`. Audit metadata only; a backend must never authorize on them. |
 | `GATEWAY_HOST`, `GATEWAY_PORT` | `0.0.0.0`, `8080` | Where the gateway listens. |
 | `AUTH_ENABLED` | `true` | **Warning:** `false` forwards every request unauthenticated. The quickstart's pass-through mode. |
@@ -113,7 +115,7 @@ field name in upper case.
 | `MANIFEST_BASELINE_PATH` | `manifest-baseline.json` | Pinned per-tool SHA-256 of `name` + `description` + `inputSchema`, persisted so drift survives a restart. Tool metadata only. |
 | `STEP_UP_DEFAULT_ACR` | `c1` | Entra authentication-context id a destructive tool requires in `acrs`, unless the policy names its own `require_acr`. The strength behind it is a Conditional Access policy in Entra. |
 | `STEP_UP_MAX_AGE` | `300` | Seconds since `auth_time` within which that authentication counts as fresh. |
-| `DPOP_MODE` | `if_present` | `off` ignores proofs; `if_present` requires a valid proof for any token carrying `cnf.jkt` and lets unbound tokens work as bearer tokens; `required` also rejects tokens without `cnf.jkt`. |
+| `DPOP_MODE` | `if_present` | `off` ignores proofs; `if_present` requires a valid proof for any token carrying `cnf.jkt` and lets unbound tokens work as bearer tokens (under `Bearer`, not `DPoP`); `required` also rejects tokens without `cnf.jkt`. |
 | `DPOP_IAT_WINDOW` | `300` | Acceptance window for a proof's `iat`, seconds both ways; the `jti` replay cache keeps entries for twice this. |
 | `TRUST_EDGE_HEADERS` | `false` | **Warning:** enable only when nothing but the edge proxy can reach the gateway. Records the proxy's `X-Client-Cert-Serial` / `X-Client-Cert-DN` in the audit `channel` block; a directly reachable gateway would let callers spoof edge identity. |
 | `GATEWAY_TLS_CERTFILE`, `GATEWAY_TLS_KEYFILE` | empty | Serve TLS from the gateway itself (the inner hop of the edge pattern). Applies to the `mcp-auth-gateway` console script; the container image's default command runs uvicorn directly, so the edge overlay passes `--ssl-*` flags instead. |
@@ -190,6 +192,15 @@ trying the CLIs without a live gateway.
   issuer and JWKS settings, but has not been exercised.
 - No shared state or high availability. The audit sink is a local file; export
   it to a SIEM for retention.
+- The hash chain exposes an edited, removed or reordered record, but not a log
+  cut short at the end: what remains still verifies. An attestation pack records
+  the terminal record hash; compare it with the log you are given, or ship records
+  to a SIEM as they are written.
+- Token validation waits for a JWKS fetch. A cold key cache, or a forced refresh
+  after an unknown `kid` (at most once per `JWKS_REFRESH_MIN_INTERVAL`), holds
+  every validation until the fetch ends, for up to PyJWT's 30-second timeout. The
+  fetch runs on a worker thread, so `/healthz` and the discovery document are
+  still served meanwhile.
 - An attestation pack's signature is checked against the pack's own embedded key
   unless `--public-key` pins the signer.
 
@@ -199,6 +210,7 @@ trying the CLIs without a live gateway.
 uv sync --extra dev
 uv run pytest -q                                  # no tenant: in-process RSA key, respx upstreams
 uv run ruff check . && uv run ruff format --check .
+uv run mypy                                       # --strict over src, as CI runs it
 uv run python tools/config_viewer.py              # local dashboard over .env, policies, audit.log
 docker compose up -d mcp-upstream && uv run mcp-auth-gateway   # gateway on the host, upstream in Docker
 ```

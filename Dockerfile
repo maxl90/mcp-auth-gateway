@@ -1,8 +1,10 @@
 # The gateway image. The demo upstreams have their own Dockerfiles under deploy/upstreams/.
 #
-# Base image pinned by digest (not mutable tag) for reproducible, supply-chain-
-# safe builds. This is the manifest-list digest for python:3.12-slim.
-# To update: docker buildx imagetools inspect python:3.12-slim
+# The base image is pinned by digest (the manifest-list digest for
+# python:3.12-slim), so the OS layer does not move under a rebuild. The Python
+# dependencies are not pinned: pip resolves the ranges in pyproject.toml at build
+# time and does not read uv.lock.
+# To update the digest: docker buildx imagetools inspect python:3.12-slim
 FROM python:3.12-slim@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203
 
 WORKDIR /app

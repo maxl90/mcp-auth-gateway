@@ -1,11 +1,9 @@
 """The session registry: one client session, N upstream sessions.
 
-This is the state that makes the aggregator a stateful MCP server. It is an
-interface so routing code never depends on where sessions live: today an
-in-memory dict for a single process (sessions die with the process and clients
-re-``initialize``; tokens are client-held, so no re-authentication), later a
-pooled or shared store if replicas need it. Each session remembers the principal
-that created it; it is only ever reused by that caller.
+This is the state that makes the aggregator a stateful MCP server. It lives in
+memory, in one process: sessions die with the process and clients re-``initialize``
+(tokens are client-held, so no re-authentication). Each session remembers the
+principal that created it; it is only ever reused by that caller.
 """
 
 from __future__ import annotations
@@ -15,7 +13,8 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Protocol
+
+from ..upstreams import Upstream
 
 
 @dataclass
@@ -23,8 +22,6 @@ class UpstreamSession:
     """The gateway's session with one upstream. ``session_id`` is the upstream's
     ``Mcp-Session-Id`` (some servers run stateless and issue none)."""
 
-    upstream: str
-    url: str
     session_id: str | None = None
     # ``initialize`` is request 0; every later request takes the next id.
     _request_ids: Iterator[int] = field(
@@ -42,7 +39,7 @@ class UpstreamSession:
 class RouteEntry:
     """Where a namespaced tool lives: the owning upstream + its original name."""
 
-    upstream: str
+    upstream: Upstream
     tool: str
 
 
@@ -55,18 +52,6 @@ class ClientSession:
     upstreams: dict[str, UpstreamSession] = field(default_factory=dict)
     routes: dict[str, RouteEntry] = field(default_factory=dict)  # namespaced -> owner
     last_seen: float = 0.0  # registry clock; drives idle eviction
-
-
-class SessionRegistry(Protocol):
-    """What routing code may assume about session storage — nothing more."""
-
-    def create(self, principal: str | None) -> ClientSession: ...
-
-    def get(self, session_id: str) -> ClientSession | None: ...
-
-    def delete(self, session_id: str) -> ClientSession | None: ...
-
-    def pop_evicted(self) -> list[ClientSession]: ...
 
 
 class InMemorySessionRegistry:
@@ -123,14 +108,3 @@ class InMemorySessionRegistry:
     def pop_evicted(self) -> list[ClientSession]:
         evicted, self._evicted = self._evicted, []
         return evicted
-
-
-_registry: SessionRegistry | None = None
-
-
-def get_registry() -> SessionRegistry:
-    """Process-wide registry, one per gateway process."""
-    global _registry
-    if _registry is None:
-        _registry = InMemorySessionRegistry()
-    return _registry

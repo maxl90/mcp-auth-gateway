@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from ..config import settings
-from .log import iter_records
+from .log import as_object, iter_records
 
 
 def _join(values: object) -> str | None:
@@ -26,18 +28,24 @@ def _join(values: object) -> str | None:
     return None
 
 
-def flatten_record(rec: dict) -> dict:
-    """Map a nested v1.0 audit record to a flat SIEM row. Missing nested pieces
+def flatten_record(rec: dict[str, Any]) -> dict[str, Any]:
+    """Map an audit record (any 1.x schema) to a flat SIEM row. Missing nested pieces
     become nulls, never errors — an old/partial record still exports."""
-    actor = rec.get("actor") or {}
-    agent = actor.get("agent") or {}
-    human = actor.get("on_behalf_of") or {}
-    arguments = rec.get("arguments") or {}
-    structure = arguments.get("structure") or {}
-    conformance = arguments.get("conformance") or {}
-    manifest = rec.get("manifest") or {}
-    channel = rec.get("channel") or {}
-    integrity = rec.get("integrity") or {}
+    actor = as_object(rec.get("actor"))
+    agent = as_object(actor.get("agent"))
+    human = as_object(actor.get("on_behalf_of"))
+    arguments = as_object(rec.get("arguments"))
+    structure = as_object(arguments.get("structure"))
+    conformance = as_object(arguments.get("conformance"))
+    manifest = as_object(rec.get("manifest"))
+    channel = as_object(rec.get("channel"))
+    integrity = as_object(rec.get("integrity"))
+    violations = conformance.get("violations")
+    keywords = (
+        [v.get("keyword") for v in violations if isinstance(v, dict)]
+        if isinstance(violations, list)
+        else []
+    )
 
     return {
         "TimeGenerated": rec.get("ts"),
@@ -74,10 +82,7 @@ def flatten_record(rec: dict) -> dict:
         "DpopJkt": channel.get("dpop_jkt"),
         # inputSchema conformance telemetry (schema 1.1). Null when untracked.
         "SchemaConformant": conformance.get("schema_conformant"),
-        "SchemaViolationKeywords": _join(
-            [v.get("keyword") for v in conformance.get("violations") or [] if isinstance(v, dict)]
-        )
-        or None,
+        "SchemaViolationKeywords": _join(keywords) or None,
         # Tamper-evidence.
         "RecordHash": integrity.get("record_hash"),
         "PrevHash": integrity.get("prev_hash"),
@@ -106,18 +111,18 @@ def _epoch_ms(ts: object) -> int | None:
         return None
 
 
-def flatten_record_ocsf(rec: dict) -> dict:
+def flatten_record_ocsf(rec: dict[str, Any]) -> dict[str, Any]:
     """Map a record to an OCSF API Activity event.
 
     A ``tools/call`` has no CRUD semantics OCSF can name, so ``activity_id`` is Other
     (99) with the tool in ``api.operation``; the agent is the OCSF ``actor`` app and
     the human is ``actor.user``. Everything else is carried under ``unmapped``.
     """
-    actor = rec.get("actor") or {}
-    agent = actor.get("agent") or {}
-    human = actor.get("on_behalf_of") or {}
-    arguments = rec.get("arguments") or {}
-    status_id, status = _OCSF_STATUS.get(rec.get("outcome"), (0, "Unknown"))
+    actor = as_object(rec.get("actor"))
+    agent = as_object(actor.get("agent"))
+    human = as_object(actor.get("on_behalf_of"))
+    arguments = as_object(rec.get("arguments"))
+    status_id, status = _OCSF_STATUS.get(str(rec.get("outcome")), (0, "Unknown"))
 
     return {
         "class_uid": 6003,
@@ -164,7 +169,7 @@ def flatten_record_ocsf(rec: dict) -> dict:
 _FORMATS = {"sentinel": flatten_record, "ocsf": flatten_record_ocsf}
 
 
-def export_lines(in_path: str | Path, fmt: str = "sentinel"):
+def export_lines(in_path: str | Path, fmt: str = "sentinel") -> Iterator[str]:
     """Yield flattened JSON-Line strings for each record in the log."""
     mapper = _FORMATS[fmt]
     for _, rec in iter_records(in_path):  # a corrupt line is skipped, not fatal

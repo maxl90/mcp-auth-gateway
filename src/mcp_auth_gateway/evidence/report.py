@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from ..config import settings
 from . import frameworks
@@ -35,7 +37,9 @@ def _status(control_signals: list[str], flags: dict[str, bool]) -> tuple[str, li
     return _PARTIAL, present, missing
 
 
-def build_bundle_from(sig: signals_mod.Signals, framework: str, audit_path: str | Path) -> dict:
+def build_bundle_from(
+    sig: signals_mod.Signals, framework: str, audit_path: str | Path
+) -> dict[str, Any]:
     """Assemble the evidence bundle from already-computed signals.
 
     Attestation packs call this with a windowed subset's signals that still carry
@@ -67,26 +71,31 @@ def build_bundle_from(sig: signals_mod.Signals, framework: str, audit_path: str 
             "from": sig.first_ts,
             "to": sig.last_ts,
             "tamper_evident": sig.tamper_evident,
+            "chain_detail": sig.chain_detail,
         },
         "signals": {
             "total_records": sig.total_records,
             "outcomes": sig.outcomes,
             "distinct_agents": sig.distinct_agents,
             "distinct_humans": sig.distinct_humans,
+            "records_with_agent": sig.records_with_agent,
+            "records_with_human": sig.records_with_human,
             "records_fully_attributed": sig.records_fully_attributed,
             "pii_touch_records": sig.pii_touch_records,
+            "schema_checked_records": sig.schema_checked_records,
+            "schema_violation_records": sig.schema_violation_records,
             "flags": flags,
         },
         "controls": controls,
     }
 
 
-def build_bundle(audit_path: str | Path, framework: str = "nist-ai-rmf") -> dict:
+def build_bundle(audit_path: str | Path, framework: str = "nist-ai-rmf") -> dict[str, Any]:
     """Compute the machine-readable evidence bundle (signals + per-control status)."""
     return build_bundle_from(signals_mod.compute(audit_path), framework, audit_path)
 
 
-def render_markdown(bundle: dict) -> str:
+def render_markdown(bundle: dict[str, Any]) -> str:
     """Render the evidence bundle as a Markdown report."""
     cov = bundle["coverage"]
     sig = bundle["signals"]
@@ -139,8 +148,9 @@ def main() -> None:
     """Console entry point."""
     # The report contains typographic unicode (em dashes); make stdout UTF-8 so a
     # cp1252 Windows console doesn't mangle or crash on it. No-op where already UTF-8.
-    with contextlib.suppress(AttributeError, ValueError):
-        sys.stdout.reconfigure(encoding="utf-8")
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        with contextlib.suppress(ValueError):
+            sys.stdout.reconfigure(encoding="utf-8")
 
     ap = argparse.ArgumentParser(description="Render an evidence report from an audit log")
     ap.add_argument("audit_path", nargs="?", default=settings.audit_log_path)

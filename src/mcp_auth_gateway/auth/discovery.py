@@ -8,6 +8,8 @@ Dynamic Client Registration is out of scope: Entra, not the gateway, is the AS.
 
 from __future__ import annotations
 
+from typing import Any
+
 from ..config import settings
 
 # RFC 9728 well-known location. Unauthenticated by design: clients fetch it
@@ -15,7 +17,7 @@ from ..config import settings
 PRM_WELL_KNOWN_PATH = "/.well-known/oauth-protected-resource"
 
 
-def build_prm_document() -> dict:
+def build_prm_document() -> dict[str, Any]:
     """The PRM document (RFC 9728), built from settings.
 
     Raises :class:`RuntimeError` when ``GATEWAY_RESOURCE_URL`` is unset; the boot

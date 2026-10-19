@@ -76,7 +76,7 @@ def probe_valid(url: str, certs: Path, cert_name: str) -> str | None:
             if not tools:
                 return "tools/list returned an empty catalog"
             return None
-    except Exception as exc:  # noqa: BLE001 — any failure is the finding
+    except Exception as exc:  # any failure is the finding
         return f"{type(exc).__name__}: {exc}"
 
 

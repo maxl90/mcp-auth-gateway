@@ -24,5 +24,16 @@ def test_iter_records_strict_reports_the_first_bad_line(tmp_path):
     assert str(info.value).startswith("line 2: not valid JSON (")
 
 
+def test_a_line_that_is_not_an_object_is_corrupt(tmp_path):
+    # Valid JSON is not enough: every reader treats a record as an object.
+    log = tmp_path / "audit.log"
+    log.write_text('{"a":1}\n[1]\n"text"\n{"a":2}\n', encoding="utf-8")
+    assert list(iter_records(log)) == [(1, {"a": 1}), (4, {"a": 2})]
+    with pytest.raises(CorruptRecord) as info:
+        list(iter_records(log, skip_corrupt=False))
+    assert info.value.lineno == 2
+    assert str(info.value) == "line 2: not a JSON object"
+
+
 def test_iter_records_absent_file_yields_nothing(tmp_path):
     assert list(iter_records(tmp_path / "missing.log")) == []

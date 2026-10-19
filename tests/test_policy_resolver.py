@@ -71,5 +71,20 @@ def test_groups_must_be_mapping(tmp_path):
 
 
 def test_empty_policy_is_valid_and_denies_all():
-    pol = Policy(groups={}, destructive=[])
+    pol = Policy(groups={})
     assert not pol.is_allowed([ANALYST_GROUP], "execute_sql")
+
+
+@pytest.mark.parametrize(
+    "allow",
+    [
+        "execute_sql",  # a bare string would split into one tool per character
+        "{execute_sql: true}",  # a mapping would grant its keys
+        "[execute_sql, 5]",  # a tool name is a string
+    ],
+)
+def test_allow_must_be_a_list_of_tool_names(tmp_path, allow):
+    p = tmp_path / "bad.yaml"
+    p.write_text(f"groups:\n  g1:\n    allow: {allow}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="allow"):
+        load_policy(p)

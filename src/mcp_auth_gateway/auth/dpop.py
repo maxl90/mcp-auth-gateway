@@ -14,15 +14,20 @@ import base64
 import hashlib
 import json
 import time
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-import jwt as pyjwt
+import jwt
 
 from ..config import settings
+from .claims import Claims
+
+if TYPE_CHECKING:
+    from jwt.algorithms import AllowedPublicKeys
 
 # Asymmetric only — a proof signed with a shared secret proves nothing about
 # key possession. Same downgrade defense as the access-token validator.
-_ALLOWED_ALGS = ["ES256", "ES384", "RS256", "RS384", "PS256", "PS384"]
+ALLOWED_ALGS = ["ES256", "ES384", "RS256", "RS384", "PS256", "PS384"]
 
 # RFC 7638 required members per key type, in lexicographic order.
 _THUMBPRINT_MEMBERS = {
@@ -50,7 +55,7 @@ def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
-def jwk_thumbprint(jwk: dict) -> str:
+def jwk_thumbprint(jwk: dict[str, Any]) -> str:
     """RFC 7638 thumbprint: SHA-256 over the canonical JSON of the key-type's
     required members, base64url without padding."""
     members = _THUMBPRINT_MEMBERS.get(jwk.get("kty", ""))
@@ -83,7 +88,7 @@ def expected_htus(request_url: str, path: str) -> set[str]:
     return accepted
 
 
-class _ReplayCache:
+class ReplayCache:
     """Seen ``jti`` values within the acceptance window. In-memory and size-capped,
     so a proof flood cannot grow it without bound; when full, expired entries go
     first, then the oldest."""
@@ -95,34 +100,32 @@ class _ReplayCache:
     def check_and_store(self, jti: str, ttl: float) -> bool:
         """False if ``jti`` was already presented (replay); True otherwise."""
         now = time.monotonic()
+        entry = self._seen.get(jti)
+        if entry is not None and entry > now:
+            return False
+        # Make room only after the lookup, or a full cache could evict this very jti.
         if len(self._seen) >= self.max_entries:
             for key, exp in list(self._seen.items()):
                 if exp <= now:
                     del self._seen[key]
             while len(self._seen) >= self.max_entries:
                 self._seen.pop(next(iter(self._seen)))
-        entry = self._seen.get(jti)
-        if entry is not None and entry > now:
-            return False
         self._seen[jti] = now + ttl
         return True
 
 
-_replay = _ReplayCache()
-
-
-def _parse_header(proof: str) -> tuple[str, dict, object]:
+def _parse_header(proof: str) -> tuple[str, dict[str, Any], AllowedPublicKeys]:
     """The proof's ``alg``, its embedded public ``jwk``, and the key object, after
     the header checks: ``typ``, an allowlisted ``alg``, no private-key members."""
     try:
-        header = pyjwt.get_unverified_header(proof)
-    except pyjwt.InvalidTokenError as exc:
+        header = jwt.get_unverified_header(proof)
+    except jwt.InvalidTokenError as exc:
         raise DpopError(f"proof is not a JWT: {exc}") from exc
 
     if header.get("typ") != "dpop+jwt":
         raise DpopError(f"proof typ must be dpop+jwt, got {header.get('typ')!r}")
     alg = header.get("alg")
-    if alg not in _ALLOWED_ALGS:
+    if alg not in ALLOWED_ALGS:
         raise DpopError(f"proof alg {alg!r} not allowed")
     jwk = header.get("jwk")
     if not isinstance(jwk, dict):
@@ -131,26 +134,28 @@ def _parse_header(proof: str) -> tuple[str, dict, object]:
         raise DpopError("proof jwk contains private-key members")
 
     try:
-        key = pyjwt.PyJWK(dict(jwk, alg=alg)).key
-    except Exception as exc:  # noqa: BLE001 — any unusable key → invalid proof
+        key = jwt.PyJWK(dict(jwk, alg=alg)).key
+    except Exception as exc:  # any unusable key → invalid proof
         raise DpopError(f"proof jwk is not a usable public key: {exc}") from exc
     return alg, jwk, key
 
 
-def _verify_claims(proof: str, key: object, alg: str) -> dict:
+def _verify_claims(proof: str, key: AllowedPublicKeys, alg: str) -> dict[str, Any]:
     """The proof's claims once its signature verifies under its own embedded key."""
     try:
-        return pyjwt.decode(
+        return jwt.decode(
             proof,
             key,
             algorithms=[alg],
             options={"require": ["jti", "htm", "htu", "iat"]},
         )
-    except pyjwt.InvalidTokenError as exc:
+    except jwt.InvalidTokenError as exc:
         raise DpopError(f"proof signature/claims invalid: {exc}") from exc
 
 
-def _check_binding(claims: dict, method: str, accepted_htus: set[str], access_token: str) -> None:
+def _check_binding(
+    claims: dict[str, Any], method: str, accepted_htus: set[str], access_token: str
+) -> None:
     """The proof names this request (``htm``, ``htu``), is fresh (``iat``), and covers
     the presented token (``ath``)."""
     if claims["htm"] != method.upper():
@@ -177,9 +182,11 @@ def validate_proof(
     accepted_htus: set[str],
     access_token: str,
     cnf_jkt: str,
+    replay: ReplayCache,
 ) -> str:
     """Validate one DPoP proof against the request + bound token; return the
-    proof key's thumbprint (== ``cnf_jkt``) on success, raise DpopError else."""
+    proof key's thumbprint (== ``cnf_jkt``) on success, raise DpopError else.
+    ``replay`` remembers every accepted ``jti``."""
     alg, jwk, key = _parse_header(proof)
     claims = _verify_claims(proof, key, alg)
     _check_binding(claims, method, accepted_htus, access_token)
@@ -189,7 +196,7 @@ def validate_proof(
         raise DpopError("proof key does not match the token's cnf.jkt binding")
 
     # Replay goes last, so a proof rejected above never consumes its jti.
-    if not _replay.check_and_store(str(claims["jti"]), ttl=settings.dpop_iat_window * 2):
+    if not replay.check_and_store(str(claims["jti"]), ttl=settings.dpop_iat_window * 2):
         raise DpopError("proof jti already used (replay)")
 
     return thumbprint
@@ -199,15 +206,17 @@ def enforce(
     *,
     scheme: str,
     access_token: str,
-    claims: dict,
+    claims: Claims,
     proofs: list[str],
     method: str,
     accepted_htus: set[str],
+    replay: ReplayCache,
 ) -> str | None:
     """Apply ``DPOP_MODE`` to one authenticated request.
 
-    Returns the bound key's thumbprint for the audit record, or ``None`` when the
-    token is unbound and bearer use is allowed. Raises :class:`DpopError` otherwise.
+    Returns the bound key's thumbprint for the audit record, or ``None`` when an
+    unbound token is presented as a bearer token and that is allowed. Raises
+    :class:`DpopError` otherwise.
     """
     mode = settings.dpop_mode
     if mode == "off":
@@ -220,6 +229,13 @@ def enforce(
         if mode == "required":
             raise DpopError(
                 "access token is not DPoP-bound (no cnf.jkt) and DPOP_MODE=required",
+                error="invalid_token",
+            )
+        # The DPoP scheme says the token is bound (§7.1). An unbound one under it is
+        # refused, not quietly read as a bearer token with its proof never checked.
+        if scheme == "dpop":
+            raise DpopError(
+                "the DPoP scheme was used with a token that is not DPoP-bound (no cnf.jkt)",
                 error="invalid_token",
             )
         return None
@@ -242,4 +258,5 @@ def enforce(
         accepted_htus=accepted_htus,
         access_token=access_token,
         cnf_jkt=cnf_jkt,
+        replay=replay,
     )

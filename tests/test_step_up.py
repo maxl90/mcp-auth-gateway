@@ -15,10 +15,10 @@ import httpx
 import pytest
 import respx
 
-from mcp_auth_gateway.auth import step_up
+from mcp_auth_gateway.auth import policy_resolver, step_up
 from mcp_auth_gateway.auth.policy_resolver import Policy, StepUpRequirement, _parse_destructive
 
-from .conftest import ANALYST_GROUP
+from .conftest import ANALYST_GROUP, UPSTREAM
 
 REQ = StepUpRequirement(require_acr="c1", max_age=300)
 
@@ -64,10 +64,8 @@ def test_scalar_acrs_tolerated():
 
 
 def test_destructive_list_form_inherits_defaults(monkeypatch):
-    from mcp_auth_gateway.auth import policy_resolver as pr
-
-    monkeypatch.setattr(pr.settings, "step_up_default_acr", "c1")
-    monkeypatch.setattr(pr.settings, "step_up_max_age", 300)
+    monkeypatch.setattr(policy_resolver.settings, "step_up_default_acr", "c1")
+    monkeypatch.setattr(policy_resolver.settings, "step_up_max_age", 300)
     parsed = _parse_destructive(["execute_sql"])
     assert parsed["execute_sql"] == StepUpRequirement("c1", 300)
 
@@ -97,8 +95,6 @@ def test_bad_destructive_shapes_raise(bad):
 
 
 # --- end-to-end enforcement -------------------------------------------------
-
-UPSTREAM = "http://localhost:9000/mcp"
 
 _POLICY = Policy(
     groups={ANALYST_GROUP: ["list_schemas", "execute_sql"]},

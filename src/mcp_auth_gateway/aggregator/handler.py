@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,14 +22,15 @@ import httpx
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
-from .. import __version__, jsonrpc
-from ..audit import manifest as audit_manifest
+from .. import __version__, jsonrpc, state
 from ..audit import writer as audit
 from ..auth import enforce
+from ..auth.claims import Claims
+from ..http_util import read_request_body
 from ..naming import namespace_tool, split_namespaced
-from ..upstreams import Upstream, get_upstream, get_upstreams
+from ..upstreams import Upstream
 from . import upstream_client
-from .registry import ClientSession, RouteEntry, get_registry
+from .registry import ClientSession, RouteEntry
 from .upstream_client import UpstreamRequest
 
 _SUPPORTED_PROTOCOL_VERSIONS = {"2025-03-26", "2025-06-18", "2025-11-25"}
@@ -37,7 +39,7 @@ _SERVER_INFO = {"name": "mcp-auth-gateway", "version": __version__}
 
 # Tools only: these answer empty-but-valid results, not errors, so well-behaved
 # clients that probe them see nothing to use.
-_EMPTY_RESULTS = {
+_EMPTY_RESULTS: dict[str, dict[str, list[Any]]] = {
     "resources/list": {"resources": []},
     "resources/templates/list": {"resourceTemplates": []},
     "prompts/list": {"prompts": []},
@@ -53,16 +55,24 @@ class _Call:
     """One authenticated request to the virtual server."""
 
     request: Request
-    claims: dict | None
+    claims: Claims | None
     correlation_id: str
 
     @property
+    def gateway(self) -> state.Gateway:
+        return state.of(self.request)
+
+    @property
     def client(self) -> httpx.AsyncClient:
-        return self.request.app.state.client
+        return self.gateway.client
 
 
 def _rpc_error(
-    request_id: Any, code: int, message: str, status: int = 200, headers: dict | None = None
+    request_id: Any,
+    code: int,
+    message: str,
+    status: int = 200,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     return JSONResponse(
         {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}},
@@ -71,13 +81,14 @@ def _rpc_error(
     )
 
 
-def _principal(claims: dict | None) -> str | None:
+def _principal(claims: Claims | None) -> str | None:
     """Who a session belongs to: the human's ``oid``, else ``sub``, else the app's ``azp``."""
-    c = claims or {}
-    return c.get("oid") or c.get("sub") or c.get("azp")
+    if not claims:
+        return None
+    return claims.get("oid") or claims.get("sub") or claims.get("azp")
 
 
-def _session_from(request: Request, claims: dict | None) -> ClientSession | None:
+def _session_from(request: Request, claims: Claims | None) -> ClientSession | None:
     """Resolve the caller's session from ``Mcp-Session-Id`` — but only if it
     belongs to them.
 
@@ -90,7 +101,7 @@ def _session_from(request: Request, claims: dict | None) -> ClientSession | None
     session_id = request.headers.get("mcp-session-id")
     if not session_id:
         return None
-    session = get_registry().get(session_id)
+    session = state.of(request).sessions.get(session_id)
     if session is None:
         return None
     if session.principal != _principal(claims):
@@ -98,13 +109,15 @@ def _session_from(request: Request, claims: dict | None) -> ClientSession | None
     return session
 
 
-async def _teardown(client: httpx.AsyncClient, session: ClientSession) -> None:
+async def _teardown(gateway: state.Gateway, session: ClientSession) -> None:
     """Best-effort DELETE of every upstream session a client session holds."""
     await asyncio.gather(
         *(
-            upstream_client.delete_session(client, upstream, up_session)
-            for name, up_session in session.upstreams.items()
-            if (upstream := get_upstream(name)) is not None
+            upstream_client.delete_session(
+                gateway.client, upstream, session.upstreams[upstream.name]
+            )
+            for upstream in gateway.upstreams.values()
+            if upstream.name in session.upstreams
         ),
         return_exceptions=True,
     )
@@ -112,7 +125,7 @@ async def _teardown(client: httpx.AsyncClient, session: ClientSession) -> None:
 
 def _audit_degraded(upstream: str, phase: str, call: _Call, detail: str) -> None:
     """A partial catalog is allowed; a silent partial catalog is not."""
-    audit.record(
+    call.gateway.audit.record(
         audit.AuditEvent(
             outcome="degraded",
             tool=None,
@@ -127,14 +140,14 @@ def _audit_degraded(upstream: str, phase: str, call: _Call, detail: str) -> None
 # --- initialize -------------------------------------------------------------------
 
 
-async def _initialize(call: _Call, message: dict) -> Response:
+async def _initialize(call: _Call, message: dict[str, Any]) -> Response:
     """Answer ``initialize`` as the virtual server and open a session to every
     upstream now, so the first ``tools/list`` is complete."""
-    upstreams = get_upstreams()
-    registry = get_registry()
+    upstreams = list(call.gateway.upstreams.values())
+    registry = call.gateway.sessions
     session = registry.create(_principal(call.claims))
     for stale in registry.pop_evicted():  # over the per-principal cap, or idle too long
-        await _teardown(call.client, stale)
+        await _teardown(call.gateway, stale)
 
     results = await asyncio.gather(
         *(upstream_client.initialize_session(call.client, u) for u in upstreams),
@@ -168,13 +181,17 @@ async def _initialize(call: _Call, message: dict) -> Response:
 
 
 async def _fetch_catalogs(
-    client: httpx.AsyncClient, session: ClientSession
-) -> list[tuple[Upstream, dict | BaseException]]:
+    gateway: state.Gateway, session: ClientSession
+) -> list[tuple[Upstream, dict[str, Any] | BaseException]]:
     """Each upstream's ``tools/list`` answer, or the exception it raised."""
-    live = [(get_upstream(name), up_session) for name, up_session in session.upstreams.items()]
+    live = [
+        (u, session.upstreams[u.name])
+        for u in gateway.upstreams.values()
+        if u.name in session.upstreams
+    ]
     results = await asyncio.gather(
         *(
-            upstream_client.rpc(UpstreamRequest(client, upstream, up_session), "tools/list")
+            upstream_client.rpc(UpstreamRequest(gateway.client, upstream, up_session), "tools/list")
             for upstream, up_session in live
         ),
         return_exceptions=True,
@@ -182,49 +199,55 @@ async def _fetch_catalogs(
     return [(upstream, result) for (upstream, _), result in zip(live, results, strict=True)]
 
 
-def _catalog_of(result: dict) -> list[dict]:
-    """The named tool entries of a ``tools/list`` result."""
-    return [
-        t
-        for t in (result.get("result") or {}).get("tools") or []
-        if isinstance(t, dict) and isinstance(t.get("name"), str)
-    ]
+def _catalog_of(response: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The named tool entries of a ``tools/list`` response, or ``None`` when its
+    ``result`` is not an object carrying a ``tools`` list."""
+    result = response.get("result")
+    tools = result.get("tools") if isinstance(result, dict) else None
+    if not isinstance(tools, list):
+        return None
+    return [t for t in tools if isinstance(t, dict) and isinstance(t.get("name"), str)]
 
 
-def _merge_catalog(upstream: str, catalog: list[dict]) -> tuple[list[dict], dict[str, RouteEntry]]:
+def _merge_catalog(
+    upstream: Upstream, catalog: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], dict[str, RouteEntry]]:
     """Namespace one upstream's tools and map each wire name back to its owner.
 
     The namespaced name is what the client calls and what the policy keys; the
     original is preserved for display."""
-    tools: list[dict] = []
+    tools: list[dict[str, Any]] = []
     routes: dict[str, RouteEntry] = {}
     for tool in catalog:
         original = tool["name"]
-        wire_name = namespace_tool(upstream, original)
+        wire_name = namespace_tool(upstream.name, original)
         routes[wire_name] = RouteEntry(upstream=upstream, tool=original)
         tools.append({**tool, "name": wire_name, "title": tool.get("title") or original})
     return tools, routes
 
 
 async def _tools_list(
-    call: _Call, message: dict, session: ClientSession, allowed: set[str] | None
+    call: _Call, message: dict[str, Any], session: ClientSession, allowed: set[str] | None
 ) -> Response:
     """Fan out, merge under namespaced names, rebuild the route map, filter to
     the caller's RBAC. ``allowed`` is None only when auth is disabled."""
-    merged: list[dict] = []
+    merged: list[dict[str, Any]] = []
     routes: dict[str, RouteEntry] = {}
-    for upstream, result in await _fetch_catalogs(call.client, session):
+    for upstream, result in await _fetch_catalogs(call.gateway, session):
         if isinstance(result, BaseException) or "error" in result:
             detail = str(result if isinstance(result, BaseException) else result["error"])
             _audit_degraded(upstream.name, "tools/list", call, detail)
             continue
         catalog = _catalog_of(result)
+        if catalog is None:
+            _audit_degraded(upstream.name, "tools/list", call, "result carries no tools list")
+            continue
         # Pin/compare tool manifests before RBAC filtering — drift evidence
         # covers the full served catalog, not just this caller's slice.
-        audit_manifest.observe_catalog(
+        call.gateway.manifests.observe_catalog(
             upstream.name, catalog, correlation_id=call.correlation_id, claims=call.claims
         )
-        tools, upstream_routes = _merge_catalog(upstream.name, catalog)
+        tools, upstream_routes = _merge_catalog(upstream, catalog)
         merged.extend(tools)
         routes.update(upstream_routes)
 
@@ -239,7 +262,9 @@ async def _tools_list(
 # --- tools/call -------------------------------------------------------------------
 
 
-def _resolve_route(session: ClientSession, wire_name: object) -> RouteEntry | None:
+def _resolve_route(
+    upstreams: Mapping[str, Upstream], session: ClientSession, wire_name: object
+) -> RouteEntry | None:
     """The owning upstream and original name: from the session's route map, or,
     before the first ``tools/list``, from the namespace prefix itself (it is how
     the policy names the tool too)."""
@@ -248,32 +273,32 @@ def _resolve_route(session: ClientSession, wire_name: object) -> RouteEntry | No
     route = session.routes.get(wire_name)
     if route is None:
         parts = split_namespaced(wire_name)
-        if parts and get_upstream(parts[0]) is not None:
-            route = RouteEntry(upstream=parts[0], tool=parts[1])
+        if parts and (upstream := upstreams.get(parts[0])) is not None:
+            route = RouteEntry(upstream=upstream, tool=parts[1])
     return route
 
 
 async def _call_with_reconnect(
     call: _Call, session: ClientSession, route: RouteEntry, request_id: Any, arguments: Any
-) -> dict:
+) -> dict[str, Any]:
     """Call the tool; if the upstream forgot our session (expiry, restart), re-open
     exactly that upstream's session and retry once rather than drop the whole
     client session. A second failure propagates and fails closed."""
-    upstream = get_upstream(route.upstream)
+    upstream = route.upstream
     attribution = upstream_client.attribution_headers(call.correlation_id, call.claims)
     try:
-        req = UpstreamRequest(call.client, upstream, session.upstreams[route.upstream])
+        req = UpstreamRequest(call.client, upstream, session.upstreams[upstream.name])
         return await upstream_client.call_tool(req, request_id, route.tool, arguments, attribution)
     except upstream_client.UpstreamSessionExpired:
         pass
     try:
         new_session = await upstream_client.initialize_session(call.client, upstream)
-        session.upstreams[route.upstream] = new_session
+        session.upstreams[upstream.name] = new_session
         req = UpstreamRequest(call.client, upstream, new_session)
         return await upstream_client.call_tool(req, request_id, route.tool, arguments, attribution)
     except upstream_client.UpstreamError as exc:
         raise upstream_client.UpstreamError(
-            route.upstream, f"after reconnect: {exc.detail}"
+            upstream.name, f"after reconnect: {exc.detail}"
         ) from exc
 
 
@@ -281,7 +306,7 @@ def _upstream_failed(
     upstream: str, exc: upstream_client.UpstreamError, call: _Call, request_id: Any
 ) -> JSONResponse:
     """A generic error for the caller; the upstream's detail goes to the server log."""
-    logger.warning(
+    logger.error(
         "upstream %s failed: %s [correlation %s]", upstream, exc.detail, call.correlation_id
     )
     return _rpc_error(
@@ -292,7 +317,7 @@ def _upstream_failed(
     )
 
 
-async def _tools_call(call: _Call, message: dict, session: ClientSession) -> Response:
+async def _tools_call(call: _Call, message: dict[str, Any], session: ClientSession) -> Response:
     """Route the call to its upstream; RBAC already passed. Unknown tools and dead
     upstreams fail closed. With ``forward_attribution_headers`` on, the upstream
     request carries the correlation id and the human's oid as audit metadata."""
@@ -300,15 +325,15 @@ async def _tools_call(call: _Call, message: dict, session: ClientSession) -> Res
     wire_name = params.get("name")
     request_id = message.get("id")
 
-    route = _resolve_route(session, wire_name)
+    route = _resolve_route(call.gateway.upstreams, session, wire_name)
     if route is None:
         return _rpc_error(request_id, -32602, f"unknown tool: {wire_name!r}")
-    if get_upstream(route.upstream) is None or route.upstream not in session.upstreams:
-        # Fail closed on calls to a dead upstream.
+    if route.upstream.name not in session.upstreams:
+        # Fail closed on calls to an upstream that was down at initialize.
         return _rpc_error(
             request_id,
             -32000,
-            f"upstream '{route.upstream}' is unavailable",
+            f"upstream '{route.upstream.name}' is unavailable",
             headers={"X-Correlation-Id": call.correlation_id},
         )
 
@@ -317,18 +342,18 @@ async def _tools_call(call: _Call, message: dict, session: ClientSession) -> Res
             call, session, route, request_id, params.get("arguments")
         )
     except upstream_client.UpstreamError as exc:
-        return _upstream_failed(route.upstream, exc, call, request_id)
+        return _upstream_failed(route.upstream.name, exc, call, request_id)
     return JSONResponse(response)
 
 
 # --- dispatch ---------------------------------------------------------------------
 
 
-def _parse_message(body: bytes) -> dict | JSONResponse:
+def _parse_message(body: bytes) -> dict[str, Any] | JSONResponse:
     """The one JSON-RPC request in the body, or the error response for anything else."""
     try:
         message = json.loads(body)
-    except (ValueError, TypeError):
+    except ValueError:
         return _rpc_error(None, -32700, "parse error: body is not valid JSON")
     if isinstance(message, list):
         # JSON-RPC batching was removed in MCP 2025-06-18; the aggregator does
@@ -343,7 +368,7 @@ def _parse_message(body: bytes) -> dict | JSONResponse:
 async def handle_post(
     request: Request,
     body: bytes,
-    claims: dict | None,
+    claims: Claims | None,
     correlation_id: str,
     allowed: set[str] | None,
 ) -> Response:
@@ -381,7 +406,7 @@ async def handle_post(
     return _rpc_error(message.get("id"), -32601, f"method not supported: {method}")
 
 
-async def handle_delete(request: Request, claims: dict | None) -> Response:
+async def handle_delete(request: Request, claims: Claims | None) -> Response:
     """End the client session and cascade teardown to every upstream session.
 
     Ownership is re-checked before deletion (via ``_session_from``) so a leaked
@@ -390,8 +415,9 @@ async def handle_delete(request: Request, claims: dict | None) -> Response:
     session = _session_from(request, claims)
     if session is None:
         return Response(status_code=404)
-    get_registry().delete(session.id)
-    await _teardown(request.app.state.client, session)
+    gateway = state.of(request)
+    gateway.sessions.delete(session.id)
+    await _teardown(gateway, session)
     return Response(status_code=204)
 
 
@@ -401,11 +427,11 @@ def handle_get() -> Response:
     return Response(status_code=405, headers={"Allow": "POST, DELETE"})
 
 
-def upstream_for_tool(tool: str) -> str | None:
+def upstream_for_tool(upstreams: Mapping[str, Upstream], tool: str) -> str | None:
     """Audit helper: the namespace prefix of an aggregated wire name, if it
     names a configured upstream."""
     parts = split_namespaced(tool)
-    return parts[0] if parts and get_upstream(parts[0]) else None
+    return parts[0] if parts and parts[0] in upstreams else None
 
 
 async def handle_mcp(request: Request) -> Response:
@@ -415,19 +441,23 @@ async def handle_mcp(request: Request) -> Response:
     if request.method == "GET":
         return handle_get()
 
-    body = await request.body() if request.method == "POST" else b""
+    body = await read_request_body(request) if request.method == "POST" else b""
+    if isinstance(body, Response):
+        return body
     correlation_id = uuid.uuid4().hex
-    guard, claims = await enforce.enforce(
-        request, body, correlation_id, upstream_for=upstream_for_tool
+    upstreams = state.of(request).upstreams
+    guard, admitted = await enforce.enforce(
+        request, body, correlation_id, upstream_for=lambda tool: upstream_for_tool(upstreams, tool)
     )
     if guard is not None:
         return guard
+    claims = admitted.claims if admitted else None
 
     if request.method == "DELETE":
         return await handle_delete(request, claims)
     if request.method != "POST":
-        return Response(status_code=405, headers={"Allow": "GET, POST, DELETE"})
+        return Response(status_code=405, headers={"Allow": "POST, DELETE"})
 
     # Auth disabled (plumbing checks): serve the catalog unfiltered.
-    allowed = enforce.allowed_tools(claims) if claims is not None else None
+    allowed = admitted.allowed_tools() if admitted else None
     return await handle_post(request, body, claims, correlation_id, allowed)

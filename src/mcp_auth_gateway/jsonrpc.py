@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from typing import Any
 
 # Compact separators so a re-serialized body matches typical MCP wire output.
 COMPACT = (",", ":")
@@ -66,12 +67,12 @@ def parse_messages(raw: bytes, content_type: str | None) -> list[object]:
             return doc if isinstance(doc, list) else [doc]
         if "text/event-stream" in ct:
             return sse_payloads(raw.decode("utf-8"))
-    except (ValueError, TypeError, UnicodeDecodeError):
+    except ValueError:  # includes UnicodeDecodeError
         pass
     return []
 
 
-def params_of(message: object) -> dict:
+def params_of(message: object) -> dict[str, Any]:
     """The ``params`` object of a JSON-RPC message, or ``{}`` when absent or not an object."""
     params = message.get("params") if isinstance(message, dict) else None
     return params if isinstance(params, dict) else {}

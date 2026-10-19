@@ -16,17 +16,13 @@ import respx
 from mcp_auth_gateway.auth.policy_resolver import Policy
 from mcp_auth_gateway.upstreams import Upstream
 
-from .conftest import ANALYST_GROUP, DENIED_GROUP
-
-PG_URL = "http://pg-upstream:9000/mcp"
-GH_URL = "http://gh-upstream:9001/mcp"
+from .conftest import ANALYST_GROUP, DENIED_GROUP, GH_URL, PG_URL
 
 _POLICY = Policy(
     groups={
         ANALYST_GROUP: ["postgres__execute_sql", "github__list_issues"],
         DENIED_GROUP: [],
     },
-    destructive=[],
 )
 
 
@@ -117,3 +113,17 @@ def test_tools_list_filtered_to_upstream_slice(aggregate_client, make_token):
         )
     names = [t["name"] for t in resp.json()["result"]["tools"]]
     assert names == ["execute_sql"]  # allowed via postgres__execute_sql only
+
+
+def test_dot_segments_cannot_escape_the_named_upstream(aggregate_client, make_token):
+    token = make_token(groups=[ANALYST_GROUP])
+    with respx.mock:
+        pg = respx.route(host="pg-upstream").mock(return_value=httpx.Response(200, json={}))
+        gh = respx.route(host="gh-upstream").mock(return_value=httpx.Response(200, json={}))
+        resp = aggregate_client.post(
+            "/mcp/postgres/..%2F..%2Fadmin",
+            json=_tools_call("execute_sql"),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert resp.status_code == 404
+    assert pg.call_count == 0 and gh.call_count == 0

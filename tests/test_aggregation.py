@@ -19,18 +19,14 @@ import pytest
 import respx
 
 from mcp_auth_gateway import main
-from mcp_auth_gateway.aggregator import registry as registry_mod
 from mcp_auth_gateway.aggregator import upstream_client
-from mcp_auth_gateway.aggregator.registry import InMemorySessionRegistry, UpstreamSession
+from mcp_auth_gateway.aggregator.registry import UpstreamSession
 from mcp_auth_gateway.aggregator.upstream_client import UpstreamRequest
-from mcp_auth_gateway.auth.policy_resolver import Policy
+from mcp_auth_gateway.auth.policy_resolver import Policy, StepUpRequirement
 from mcp_auth_gateway.upstreams import Upstream
 
-from .conftest import ANALYST_GROUP, DENIED_GROUP
+from .conftest import ANALYST_GROUP, DENIED_GROUP, GH_URL, PG_URL
 from .fakes import fake_upstream
-
-PG_URL = "http://pg-upstream:9000/mcp"
-GH_URL = "http://gh-upstream:9001/mcp"
 
 PG_TOOLS = ["execute_sql", "list_schemas"]
 GH_TOOLS = ["list_issues", "merge_pull_request"]
@@ -46,7 +42,10 @@ _POLICY = Policy(
         ],
         DENIED_GROUP: ["github__list_issues"],
     },
-    destructive=["postgres__execute_sql", "github__merge_pull_request"],
+    destructive={
+        "postgres__execute_sql": StepUpRequirement("c1", 300),
+        "github__merge_pull_request": StepUpRequirement("c1", 300),
+    },
 )
 
 
@@ -476,7 +475,7 @@ def test_concurrent_calls_on_one_session_get_their_own_answers():
     tools = ["list_items", "summary", "get_item", "activity"]
     responder, seen = _stateful_upstream(len(tools))
     upstream = Upstream("planner", PG_URL)
-    session = UpstreamSession(upstream="planner", url=PG_URL, session_id="pl-sess")
+    session = UpstreamSession(session_id="pl-sess")
 
     async def go() -> list[dict]:
         async with httpx.AsyncClient() as http:
@@ -555,7 +554,7 @@ def test_control_rpc_carries_its_read_timeout():
     """The control read bound must reach the request itself: the pooled client has
     no read timeout, so without it a hung upstream hangs the caller."""
     upstream = Upstream("planner", PG_URL)
-    session = UpstreamSession(upstream="planner", url=PG_URL, session_id="pl-sess")
+    session = UpstreamSession(session_id="pl-sess")
 
     async def go() -> dict:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=None)) as http:
@@ -587,7 +586,7 @@ def test_control_rpc_times_out():
         server = await asyncio.start_server(hang, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
         upstream = Upstream("slow", f"http://127.0.0.1:{port}/mcp")
-        session = UpstreamSession(upstream="slow", url=upstream.url, session_id="s")
+        session = UpstreamSession(session_id="s")
         started = time.monotonic()
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=None)) as http:
@@ -671,12 +670,10 @@ def test_app_only_tokens_are_distinct_session_principals(
 
 
 def test_session_cap_evicts_the_oldest_and_tears_down_its_upstreams(
-    aggregate_client, make_token, mock_upstreams, monkeypatch
+    aggregate_client, make_token, mock_upstreams
 ):
     pg, gh = mock_upstreams
-    monkeypatch.setattr(
-        registry_mod, "_registry", InMemorySessionRegistry(max_sessions_per_principal=1)
-    )
+    aggregate_client.app.state.gateway.sessions.max_sessions_per_principal = 1
     token = make_token(groups=[ANALYST_GROUP])
     first = _initialize(aggregate_client, token)
     second = _initialize(aggregate_client, token)
@@ -696,3 +693,44 @@ def test_session_cap_evicts_the_oldest_and_tears_down_its_upstreams(
         headers={"Authorization": f"Bearer {token}", "Mcp-Session-Id": second},
     )
     assert alive.status_code == 200
+
+
+@pytest.mark.parametrize("result", [[1], "tools", {"tools": 5}, {"tools": "x"}])
+def test_malformed_tools_list_result_degrades_that_upstream(
+    aggregate_client, make_token, tmp_path, result
+):
+    """An upstream's ``result`` is its own to shape. One that is not an object with a
+    ``tools`` list is treated like any other failed upstream: left out, and audited."""
+    healthy = fake_upstream("postgres", PG_TOOLS, "pg-sess")
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            msg = json.loads(request.content)
+            if msg.get("method") == "tools/list":
+                return httpx.Response(
+                    200, json={"jsonrpc": "2.0", "id": msg["id"], "result": result}
+                )
+        return healthy(request)
+
+    token = make_token(groups=[ANALYST_GROUP])
+    with respx.mock:
+        respx.route(url=PG_URL).mock(side_effect=responder)
+        respx.route(url=GH_URL).mock(side_effect=fake_upstream("github", GH_TOOLS, "gh-sess"))
+        session = _initialize(aggregate_client, token)
+        resp = aggregate_client.post(
+            "/mcp",
+            json=_rpc("tools/list"),
+            headers={"Authorization": f"Bearer {token}", "Mcp-Session-Id": session},
+        )
+    assert resp.status_code == 200
+    assert [t["name"] for t in resp.json()["result"]["tools"]] == ["github__list_issues"]
+    records = [json.loads(ln) for ln in (tmp_path / "audit.log").read_text().splitlines()]
+    assert [r["upstream"] for r in records if r["outcome"] == "degraded"] == ["postgres"]
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+def test_405_advertises_only_the_methods_that_work(aggregate_client, make_token, method):
+    token = make_token(groups=[ANALYST_GROUP])
+    resp = aggregate_client.request(method, "/mcp", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 405
+    assert resp.headers["allow"] == "POST, DELETE"

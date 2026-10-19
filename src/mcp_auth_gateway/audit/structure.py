@@ -55,13 +55,13 @@ def _looks_pii(column: str) -> bool:
     return any(hint in c for hint in _PII_HINTS)
 
 
-def _describe_sql(sql: Any) -> dict:
+def _describe_sql(sql: Any) -> dict[str, Any]:
     """Tables, columns, statement types and PII-shaped columns of a SQL string; never the SQL."""
     if not isinstance(sql, str):
         return {"kind": "sql", "sql_present": bool(sql)}
     try:
         statements = sqlglot.parse(sql)
-    except Exception:  # noqa: BLE001 — any parser error degrades, never leaks
+    except Exception:  # any parser error degrades, never leaks
         return {"kind": "sql", "parse_error": True}
 
     tables: set[str] = set()
@@ -89,7 +89,7 @@ def _describe_sql(sql: Any) -> dict:
     }
 
 
-def describe(tool: str, arguments: Any) -> dict | None:
+def describe(tool: str, arguments: Any) -> dict[str, Any] | None:
     """Value-free structural metadata for a ``tools/call``, or ``None`` without arguments.
 
     A SQL-running tool (base name ``execute_sql``) yields table/column/PII shape; any

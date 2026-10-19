@@ -1,5 +1,5 @@
-"""``WWW-Authenticate`` values are quoted-string-escaped, so a crafted token header
-cannot inject auth-params into the challenge."""
+"""``WWW-Authenticate`` values are quoted-string-escaped, so a crafted proof or token
+header cannot inject auth-params into the challenge."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from mcp_auth_gateway.auth import enforce
 
 
 def test_www_authenticate_escapes_injected_quotes():
-    # A crafted kid echoed into error_description must not be able to open a new
+    # A crafted header field echoed into error_description must not be able to open a new
     # auth-param (e.g. a rogue resource_metadata pointer).
     malicious = 'zzz", resource_metadata="https://attacker.example/evil'
     header = enforce.www_authenticate(error="invalid_token", description=malicious)

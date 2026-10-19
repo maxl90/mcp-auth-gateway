@@ -92,7 +92,13 @@ $patch = @{
     })
   }
   optionalClaims = @{
-    accessToken = @(@{ name = "groups"; essential = $false; additionalProperties = @() })
+    # groups: the RBAC input. auth_time: the step-up freshness input (the gateway
+    # fails a destructive call closed when the token cannot prove when the user
+    # last authenticated).
+    accessToken = @(
+      @{ name = "groups";    essential = $false; additionalProperties = @() },
+      @{ name = "auth_time"; essential = $false; additionalProperties = @() }
+    )
   }
 } | ConvertTo-Json -Depth 12
 
@@ -100,6 +106,14 @@ $tmp = New-TemporaryFile
 Set-Content -Path $tmp -Value $patch -Encoding utf8
 az rest --method PATCH --url "https://graph.microsoft.com/v1.0/applications/$appObjId" --headers "Content-Type=application/json" --body "@$tmp" -o none
 Remove-Item $tmp -Force
+
+# --- 2b. Service principal ---------------------------------------------------
+# Sign-in needs the app's service principal in this tenant. Entra creates one at
+# first consent in some flows but not all; create it explicitly (idempotent).
+Say "Ensuring the app's service principal..."
+$sp = $null
+try { $sp = az ad sp show --id $appId -o json 2>$null | ConvertFrom-Json } catch {}
+if (-not $sp) { az ad sp create --id $appId -o none }
 
 # --- 3. Security groups -----------------------------------------------------
 function Ensure-Group($name){
@@ -187,8 +201,10 @@ groups:
       - execute_sql
   "$($gDenied.id)":         # $DeniedGroup (denied — no tools)
     allow: []
-# Phase 2 (step-up) hook — not enforced in Phase 1. execute_sql can run
-# destructive statements; Phase 2 will inspect args and require step-up.
+# Destructive tools require a fresh step-up (RFC 9470): the token must carry the
+# Entra authentication context STEP_UP_DEFAULT_ACR (default c1) within
+# STEP_UP_MAX_AGE seconds of auth_time. The context and the Conditional Access
+# policy behind it are created in the Entra admin center (see infra/README.md).
 destructive:
   - execute_sql
 "@ | Set-Content -Path (Join-Path $OutDir "..\policy.generated.yaml") -Encoding utf8
@@ -206,3 +222,5 @@ Write-Host ("  denied  user  : {0}" -f $uDenied.upn)
 Write-Host ""
 Write-Host "Wrote: entra-output.json (incl. generated passwords), ../.env.generated, ../policy.generated.yaml" -ForegroundColor Green
 Write-Host "Test-user passwords are in entra-output.json. Keep it out of git." -ForegroundColor Yellow
+Write-Host "Step-up needs two things this script cannot create: an authentication context 'c1' and a" -ForegroundColor Yellow
+Write-Host "Conditional Access policy requiring MFA for it (sign-in frequency = STEP_UP_MAX_AGE). See infra/README.md." -ForegroundColor Yellow

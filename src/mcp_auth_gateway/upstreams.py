@@ -67,21 +67,6 @@ def load_upstreams(path: str | Path | None = None) -> list[Upstream]:
     return [_parse_entry(entry, seen) for entry in entries]
 
 
-_upstreams: list[Upstream] | None = None
-
-
 def aggregation_enabled() -> bool:
     """Aggregation mode is opt-in via ``UPSTREAMS_CONFIG_PATH``."""
     return bool(settings.upstreams_config_path)
-
-
-def get_upstreams() -> list[Upstream]:
-    """Process-wide upstream list, loaded once at first use (like the policy)."""
-    global _upstreams
-    if _upstreams is None:
-        _upstreams = load_upstreams()
-    return _upstreams
-
-
-def get_upstream(name: str) -> Upstream | None:
-    return next((u for u in get_upstreams() if u.name == name), None)

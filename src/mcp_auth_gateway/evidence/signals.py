@@ -11,8 +11,9 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-from ..audit.log import iter_records
+from ..audit.log import as_object, iter_records
 from ..audit.verify import verify_file
 
 
@@ -52,43 +53,44 @@ class Signals:
         }
 
 
-def _count_outcome(s: Signals, rec: dict) -> None:
+def _count_outcome(s: Signals, rec: dict[str, Any]) -> None:
     outcome = rec.get("outcome")
     if isinstance(outcome, str):
         s.outcomes[outcome] = s.outcomes.get(outcome, 0) + 1
 
 
-def _count_actor(s: Signals, rec: dict, agents: set[str], humans: set[str]) -> None:
-    actor = rec.get("actor") or {}
-    agent = actor.get("agent") or None
-    human = actor.get("on_behalf_of") or None
-    if agent and agent.get("app_id"):
+def _count_actor(s: Signals, rec: dict[str, Any], agents: set[str], humans: set[str]) -> None:
+    actor = as_object(rec.get("actor"))
+    agent = as_object(actor.get("agent"))
+    human = as_object(actor.get("on_behalf_of"))
+    app_id, oid = agent.get("app_id"), human.get("oid")
+    if isinstance(app_id, str) and app_id:
         s.records_with_agent += 1
-        agents.add(agent["app_id"])
-    if human and human.get("oid"):
+        agents.add(app_id)
+    if isinstance(oid, str) and oid:
         s.records_with_human += 1
-        humans.add(human["oid"])
+        humans.add(oid)
     if agent and human:
         s.records_fully_attributed += 1
 
 
-def _count_structure(s: Signals, rec: dict) -> None:
-    structure = (rec.get("arguments") or {}).get("structure")
+def _count_structure(s: Signals, rec: dict[str, Any]) -> None:
+    structure = as_object(as_object(rec.get("arguments")).get("structure"))
     if structure:
         s.structured_records += 1
         if structure.get("touches_pii"):
             s.pii_touch_records += 1
 
 
-def _count_conformance(s: Signals, rec: dict) -> None:
-    conformance = (rec.get("arguments") or {}).get("conformance")
+def _count_conformance(s: Signals, rec: dict[str, Any]) -> None:
+    conformance = as_object(rec.get("arguments")).get("conformance")
     if isinstance(conformance, dict) and "schema_conformant" in conformance:
         s.schema_checked_records += 1
         if conformance.get("schema_conformant") is False:
             s.schema_violation_records += 1
 
 
-def _track_window(s: Signals, rec: dict) -> None:
+def _track_window(s: Signals, rec: dict[str, Any]) -> None:
     ts = rec.get("ts")
     if isinstance(ts, str):
         if s.first_ts is None or ts < s.first_ts:
@@ -97,7 +99,7 @@ def _track_window(s: Signals, rec: dict) -> None:
             s.last_ts = ts
 
 
-def aggregate(records: Iterable[dict]) -> Signals:
+def aggregate(records: Iterable[dict[str, Any]]) -> Signals:
     """Aggregate signals over already-parsed records; no file I/O and no chain check.
 
     The seam exists so an attestation pack can aggregate a windowed subset while the

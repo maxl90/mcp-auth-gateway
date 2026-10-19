@@ -16,7 +16,8 @@ class Settings(BaseSettings):
 
     # The upstream MCP server's Streamable HTTP endpoint (single-upstream mode).
     upstream_mcp_url: str = "http://localhost:9000/mcp"
-    # Cap on a buffered upstream response (tools/list filtering, aggregator RPCs); 0 disables.
+    # Cap on any body the gateway buffers: every request body (read before authentication)
+    # and the upstream responses it parses (tools/list filtering, aggregator RPCs). 0 disables.
     max_upstream_response_bytes: int = 10 * 1024 * 1024
 
     # Path to upstreams.yaml; setting it switches the gateway into aggregation mode.

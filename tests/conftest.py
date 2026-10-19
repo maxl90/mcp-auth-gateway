@@ -1,10 +1,10 @@
 """Shared test fixtures.
 
-Tokens are minted with an in-process RSA key and the validator's ``PyJWKClient``
-is patched to hand back the matching public key, so the full ``jwt.decode`` path
-(signature, aud, iss, exp, alg allowlist) runs for real without Entra. The
-``gateway_client`` factory drives the real ASGI app with that validator, a policy,
-a temp audit log, and either the single-upstream proxy or aggregation mode;
+Tokens are minted with an in-process RSA key and the validator resolves every
+token to the matching public key instead of fetching a JWKS, so the full
+``jwt.decode`` path (signature, aud, iss, exp, alg allowlist) runs for real without
+Entra. The ``gateway_client`` factory builds a real app with that validator, a
+policy, a temp audit log, and either the single-upstream proxy or aggregation mode;
 ``legacy_client`` and ``aggregate_client`` are the two ready-made shapes, and a
 module overrides ``policy`` (and ``upstreams``) to supply its own.
 """
@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import time
 from collections.abc import Iterator
+from types import SimpleNamespace
 
 import jwt
 import pytest
@@ -21,12 +22,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
 from mcp_auth_gateway import main
-from mcp_auth_gateway import upstreams as upstreams_mod
-from mcp_auth_gateway.aggregator import registry as registry_mod
-from mcp_auth_gateway.aggregator.registry import InMemorySessionRegistry
-from mcp_auth_gateway.audit import writer
-from mcp_auth_gateway.auth import enforce
 from mcp_auth_gateway.auth.policy_resolver import Policy
+from mcp_auth_gateway.auth.token_validator import TokenValidator
 from mcp_auth_gateway.upstreams import Upstream
 
 ISSUER = "https://login.microsoftonline.com/test-tenant/v2.0"
@@ -72,27 +69,26 @@ def make_token(rsa_key):
     return _make
 
 
+class LocalKeyValidator(TokenValidator):
+    """A real ``TokenValidator`` whose JWKS is one in-process public key, not a fetch."""
+
+    def __init__(self, public_key) -> None:
+        self._signing_key = SimpleNamespace(key=public_key)
+        super().__init__(jwks_url="https://example/keys", issuer=ISSUER, audience=AUDIENCE)
+
+    def _new_client(self):
+        return SimpleNamespace(get_signing_key_from_jwt=lambda token: self._signing_key)
+
+
 @pytest.fixture
-def validator(rsa_key, monkeypatch):
-    """A TokenValidator whose JWKS lookup returns our in-process public key."""
-    from mcp_auth_gateway.auth import token_validator as tv
-
-    class _FakeSigningKey:
-        key = rsa_key.public_key()
-
-    def _fake_get_signing_key_from_jwt(self, token):  # noqa: ANN001
-        return _FakeSigningKey()
-
-    monkeypatch.setattr(tv.PyJWKClient, "get_signing_key_from_jwt", _fake_get_signing_key_from_jwt)
-    # Avoid the constructor's network/config and build directly.
-    monkeypatch.setattr(tv.PyJWKClient, "__init__", lambda self, *a, **k: None)
-    return tv.TokenValidator(jwks_url="https://example/keys", issuer=ISSUER, audience=AUDIENCE)
+def validator(rsa_key) -> TokenValidator:
+    return LocalKeyValidator(rsa_key.public_key())
 
 
 @pytest.fixture
 def policy() -> Policy:
     """The RBAC policy the gateway fixtures load. A module overrides it with its own."""
-    return Policy(groups={ANALYST_GROUP: ["list_schemas"], DENIED_GROUP: []}, destructive=[])
+    return Policy(groups={ANALYST_GROUP: ["list_schemas"], DENIED_GROUP: []})
 
 
 @pytest.fixture
@@ -108,8 +104,9 @@ def gateway_client(validator, monkeypatch, tmp_path):
     ``gateway_client(mode, policy, **settings)`` yields a client with auth on, the
     in-process validator, ``policy`` loaded, a temp audit log, and either the
     single-upstream proxy (``"single"``, pointed at ``UPSTREAM``) or aggregation
-    mode (``"aggregate"``, with ``upstreams`` injected and a fresh session
-    registry). Extra keyword arguments override settings.
+    mode (``"aggregate"``, over ``upstreams``). Each client is a new app, so its
+    audit chain, pins, sessions and replay cache start empty. ``validator``
+    replaces the in-process one; other keyword arguments override settings.
     """
 
     @contextlib.contextmanager
@@ -118,10 +115,9 @@ def gateway_client(validator, monkeypatch, tmp_path):
         policy: Policy,
         *,
         upstreams: list[Upstream] | None = None,
+        validator: TokenValidator = validator,
         **settings_overrides: object,
     ) -> Iterator[TestClient]:
-        monkeypatch.setattr(enforce, "get_validator", lambda: validator)
-        monkeypatch.setattr(enforce, "get_policy", lambda: policy)
         values: dict[str, object] = {
             "auth_enabled": True,
             "gateway_resource_url": RESOURCE_URL,
@@ -129,18 +125,15 @@ def gateway_client(validator, monkeypatch, tmp_path):
             "gateway_external_base_url": "",
             "dpop_mode": "if_present",
             "audit_log_path": str(tmp_path / "audit.log"),
+            "manifest_baseline_path": str(tmp_path / "manifest-baseline.json"),
             "upstream_mcp_url": UPSTREAM,
             "upstreams_config_path": "injected" if mode == "aggregate" else "",
         }
         values.update(settings_overrides)
         for name, value in values.items():
             monkeypatch.setattr(main.settings, name, value)
-        if mode == "aggregate":
-            monkeypatch.setattr(upstreams_mod, "_upstreams", upstreams)
-            monkeypatch.setattr(registry_mod, "_registry", InMemorySessionRegistry())
-        writer._chain["path"] = None  # a fresh chain for the temp log
-        writer._chain["last_hash"] = None
-        with TestClient(main.app) as c:
+        app = main.create_app(validator=validator, policy=policy, upstreams=upstreams)
+        with TestClient(app) as c:
             yield c
 
     return _make

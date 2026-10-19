@@ -10,9 +10,14 @@ trail is one input to its assessment, not the whole judgment.
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
+import yaml
+
 # Each control: id, title, the signal flags that evidence it, and a short note
 # on what the audit log actually shows for that control.
-NIST_AI_RMF: dict = {
+NIST_AI_RMF: dict[str, Any] = {
     "framework": "NIST AI RMF 1.0",
     "disclaimer": (
         "Starter mapping. Subcategory intent is paraphrased; validate control "
@@ -74,7 +79,7 @@ NIST_AI_RMF: dict = {
 }
 
 
-EU_AI_ACT: dict = {
+EU_AI_ACT: dict[str, Any] = {
     "framework": "EU AI Act (Regulation (EU) 2024/1689) — high-risk lens",
     "disclaimer": (
         "Starter mapping, not legal advice. Article intent is paraphrased; "
@@ -147,7 +152,7 @@ EU_AI_ACT: dict = {
 }
 
 
-SOC2: dict = {
+SOC2: dict[str, Any] = {
     "framework": "SOC 2 — 2017 Trust Services Criteria (Security)",
     "disclaimer": (
         "Starter mapping, not an attestation. Criteria are paraphrased; a SOC 2 "
@@ -212,15 +217,11 @@ SOC2: dict = {
 BUILT_IN = {"nist-ai-rmf": NIST_AI_RMF, "eu-ai-act": EU_AI_ACT, "soc2": SOC2}
 
 
-def load(name_or_path: str) -> dict:
+def load(name_or_path: str) -> dict[str, Any]:
     """Return a built-in control map by name, or load one from a YAML path."""
     key = name_or_path.lower()
     if key in BUILT_IN:
         return BUILT_IN[key]
-    from pathlib import Path
-
-    import yaml  # local import: only needed for custom maps
-
     doc = yaml.safe_load(Path(name_or_path).read_text(encoding="utf-8"))
     if not isinstance(doc, dict) or "controls" not in doc:
         raise ValueError("framework map must be a mapping with a 'controls' list")

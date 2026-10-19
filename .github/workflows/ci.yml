@@ -32,9 +32,17 @@ jobs:
         run: uv run ruff check .
       - name: Format
         run: uv run ruff format --check .
+      - name: Type check
+        run: uv run mypy
 
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python }}
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
@@ -42,11 +50,11 @@ jobs:
         with:
           enable-cache: true
       - name: Set up Python
-        run: uv python install 3.12
+        run: uv python install ${{ matrix.python }}
       - name: Install dependencies
         run: uv sync --extra dev
       - name: Tests with coverage floor
-        run: uv run pytest -q --cov=mcp_auth_gateway --cov-fail-under=87
+        run: uv run pytest -q --cov=mcp_auth_gateway --cov-fail-under=95
 
   image:
     runs-on: ubuntu-latest

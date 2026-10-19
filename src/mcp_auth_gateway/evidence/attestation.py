@@ -18,6 +18,7 @@ import argparse
 import base64
 import contextlib
 import hashlib
+import io
 import json
 import sys
 import tempfile
@@ -25,10 +26,15 @@ import zipfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from .. import __version__
 from ..audit.export import flatten_record, flatten_record_ocsf
-from ..audit.log import iter_records
+from ..audit.log import as_object, iter_records
 from ..audit.verify import VerifyResult, verify_file
 from ..config import settings
 from . import signals as signals_mod
@@ -68,7 +74,7 @@ def _parse_bound(value: str | None, *, end: bool) -> datetime | None:
     return ts
 
 
-def _record_ts(rec: dict) -> datetime | None:
+def _record_ts(rec: dict[str, Any]) -> datetime | None:
     raw = rec.get("ts")
     if not isinstance(raw, str):
         return None
@@ -79,7 +85,9 @@ def _record_ts(rec: dict) -> datetime | None:
     return ts if ts.tzinfo else ts.replace(tzinfo=UTC)
 
 
-def _window(records: list[dict], lo: datetime | None, hi: datetime | None) -> list[dict]:
+def _window(
+    records: list[dict[str, Any]], lo: datetime | None, hi: datetime | None
+) -> list[dict[str, Any]]:
     if lo is None and hi is None:
         return records
     out = []
@@ -101,9 +109,6 @@ def _sha256(data: bytes) -> str:
 
 def generate_key(path: str | Path) -> str:
     """Write a new Ed25519 private key PEM; return the public key hex."""
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
     key = Ed25519PrivateKey.generate()
     pem = key.private_bytes(
         serialization.Encoding.PEM,
@@ -115,18 +120,15 @@ def generate_key(path: str | Path) -> str:
     return pub.hex()
 
 
-def _load_signer(path: str | Path):
-    from cryptography.hazmat.primitives import serialization
-
+def _load_signer(path: str | Path) -> tuple[Ed25519PrivateKey, str]:
     key = serialization.load_pem_private_key(Path(path).read_bytes(), password=None)
+    if not isinstance(key, Ed25519PrivateKey):
+        raise ValueError(f"{path}: the signing key must be an Ed25519 private key")
     pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     return key, pub.hex()
 
 
 def _verify_signature(manifest_bytes: bytes, signature_b64: str, public_key_hex: str) -> bool:
-    from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
     try:
         Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex)).verify(
             base64.b64decode(signature_b64), manifest_bytes
@@ -188,14 +190,14 @@ class _LogSnapshot:
 
     path: Path
     chain: VerifyResult
-    records: list[dict]
-    windowed: list[dict]
+    records: list[dict[str, Any]]
+    windowed: list[dict[str, Any]]
 
     @property
     def terminal_hash(self) -> str | None:
         if not self.records:
             return None
-        return (self.records[-1].get("integrity") or {}).get("record_hash")
+        return as_object(self.records[-1].get("integrity")).get("record_hash")
 
 
 def _snapshot(audit_path: Path, options: PackOptions) -> _LogSnapshot:
@@ -240,7 +242,7 @@ def _collect_members(snap: _LogSnapshot, options: PackOptions, *, signed: bool) 
 
 def _build_manifest(
     snap: _LogSnapshot, options: PackOptions, members: dict[str, bytes], pub_hex: str | None
-) -> dict:
+) -> dict[str, Any]:
     return {
         "pack_format": PACK_FORMAT,
         "name": options.name or snap.path.stem,
@@ -262,7 +264,12 @@ def _build_manifest(
     }
 
 
-def _write_zip(out_zip: Path, members: dict[str, bytes], manifest: dict, signer) -> None:
+def _write_zip(
+    out_zip: Path,
+    members: dict[str, bytes],
+    manifest: dict[str, Any],
+    signer: Ed25519PrivateKey | None,
+) -> None:
     """Write the members, the manifest, and (when signing) the detached signature over
     the exact manifest bytes."""
     manifest_bytes = json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8")
@@ -277,7 +284,7 @@ def _write_zip(out_zip: Path, members: dict[str, bytes], manifest: dict, signer)
 
 def build_pack(
     audit_path: str | Path, out_zip: str | Path, options: PackOptions | None = None
-) -> dict:
+) -> dict[str, Any]:
     """Build the pack; return the manifest that was written into it."""
     options = options or PackOptions()
     snap = _snapshot(Path(audit_path), options)
@@ -291,7 +298,7 @@ def build_pack(
 # --- verify ---------------------------------------------------------------------
 
 
-def _check_members(zf: zipfile.ZipFile, names: set[str], manifest: dict) -> list[str]:
+def _check_members(zf: zipfile.ZipFile, names: set[str], manifest: dict[str, Any]) -> list[str]:
     """Every listed member is present with the listed hash, and nothing else rides along."""
     problems: list[str] = []
     listed = {f["name"]: f for f in manifest.get("files", [])}
@@ -309,7 +316,7 @@ def _check_members(zf: zipfile.ZipFile, names: set[str], manifest: dict) -> list
 def _check_signature(
     zf: zipfile.ZipFile,
     names: set[str],
-    manifest: dict,
+    manifest: dict[str, Any],
     manifest_bytes: bytes,
     public_key: str | None,
 ) -> list[str]:
@@ -336,7 +343,7 @@ def _check_signature(
     return problems
 
 
-def _check_chain(zf: zipfile.ZipFile, names: set[str], manifest: dict) -> list[str]:
+def _check_chain(zf: zipfile.ZipFile, names: set[str], manifest: dict[str, Any]) -> list[str]:
     """The contained log still chain-verifies to the state the manifest declares."""
     if "audit.log" not in names:
         return ["audit.log missing from pack"]
@@ -352,6 +359,22 @@ def _check_chain(zf: zipfile.ZipFile, names: set[str], manifest: dict) -> list[s
             f"records={declared.get('records')}"
         ]
     return []
+
+
+def _shape_problems(manifest: dict[str, Any]) -> list[str]:
+    """The manifest fields the checks read, each refused unless it has the shape it
+    is read as, so a doctored manifest is reported rather than crashing them."""
+    problems = []
+    files = manifest.get("files", [])
+    if not isinstance(files, list) or not all(
+        isinstance(f, dict) and isinstance(f.get("name"), str) for f in files
+    ):
+        problems.append("files must be a list of objects that each name a member")
+    if not isinstance(manifest.get("signature"), dict | None):
+        problems.append("signature must be an object or null")
+    if not isinstance(manifest.get("chain", {}), dict):
+        problems.append("chain must be an object")
+    return [f"{_MANIFEST_NAME}: {p}" for p in problems]
 
 
 def verify_pack(zip_path: str | Path, *, public_key: str | None = None) -> tuple[bool, list[str]]:
@@ -370,6 +393,10 @@ def verify_pack(zip_path: str | Path, *, public_key: str | None = None) -> tuple
             manifest = json.loads(manifest_bytes)
         except ValueError as exc:
             return False, [f"{_MANIFEST_NAME} is not valid JSON ({exc})"]
+        if not isinstance(manifest, dict):
+            return False, [f"{_MANIFEST_NAME} is not a JSON object"]
+        if shape := _shape_problems(manifest):
+            return False, shape
         problems = (
             _check_members(zf, names, manifest)
             + _check_signature(zf, names, manifest, manifest_bytes, public_key)
@@ -388,8 +415,9 @@ def _is_signed(zip_path: str | Path) -> bool:
 
 def main() -> None:
     """Console entry point."""
-    with contextlib.suppress(AttributeError, ValueError):
-        sys.stdout.reconfigure(encoding="utf-8")
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        with contextlib.suppress(ValueError):
+            sys.stdout.reconfigure(encoding="utf-8")
 
     ap = argparse.ArgumentParser(
         description="Build or verify a signed, time-windowed evidence attestation pack"

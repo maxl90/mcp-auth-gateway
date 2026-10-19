@@ -33,16 +33,12 @@ class Policy:
     def __init__(
         self,
         groups: dict[str, list[str]],
-        destructive: dict[str, StepUpRequirement] | list[str] | None = None,
+        destructive: dict[str, StepUpRequirement] | None = None,
     ) -> None:
         # group object id -> allowed tool names (as a set for O(1) lookup)
-        self._groups: dict[str, set[str]] = {gid: set(tools or []) for gid, tools in groups.items()}
-        # tool name -> step-up requirement; a bare list expands to the configured defaults.
-        if isinstance(destructive, list):
-            default = StepUpRequirement(settings.step_up_default_acr, settings.step_up_max_age)
-            self._destructive = {tool: default for tool in destructive}
-        else:
-            self._destructive = dict(destructive or {})
+        self._groups: dict[str, set[str]] = {gid: set(tools) for gid, tools in groups.items()}
+        # tool name -> step-up requirement (see _parse_destructive for the file's forms)
+        self._destructive = destructive or {}
 
     def allowed_tools(self, group_ids: Iterable[str]) -> set[str]:
         """Union of the allow-lists for every group the caller belongs to."""
@@ -78,10 +74,12 @@ def load_policy(path: str | Path | None = None) -> Policy:
     # Each group maps to an object with an `allow` list: {gid: {allow: [tool, ...]}}.
     groups: dict[str, list[str]] = {}
     for gid, entry in raw_groups.items():
-        allow = (entry or {}).get("allow", []) if isinstance(entry, dict) else None
-        if allow is None:
-            raise ValueError(f"policy group '{gid}' must be a mapping with an 'allow' list")
-        groups[gid] = list(allow)
+        allow = entry.get("allow", []) if isinstance(entry, dict) else None
+        if not isinstance(allow, list) or not all(isinstance(t, str) for t in allow):
+            raise ValueError(
+                f"policy group '{gid}' must be a mapping with an 'allow' list of tool names"
+            )
+        groups[gid] = allow
 
     return Policy(groups=groups, destructive=_parse_destructive(doc.get("destructive")))
 
@@ -116,14 +114,3 @@ def _parse_destructive(raw: object) -> dict[str, StepUpRequirement]:
     if isinstance(raw, dict):
         return {tool: _requirement_from(tool, spec, defaults) for tool, spec in raw.items()}
     raise ValueError("policy 'destructive' must be a list of tool names or a mapping")
-
-
-_policy: Policy | None = None
-
-
-def get_policy() -> Policy:
-    """Process-wide policy, loaded once at first use."""
-    global _policy
-    if _policy is None:
-        _policy = load_policy()
-    return _policy

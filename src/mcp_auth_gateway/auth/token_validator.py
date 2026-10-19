@@ -9,13 +9,16 @@ once without letting bogus ``kid`` floods turn into a fetch storm.
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from typing import cast
 
 import jwt
 from jwt import PyJWKClient
 from jwt.exceptions import PyJWKClientError
 
 from ..config import settings
+from .claims import Claims
 
 logger = logging.getLogger("mcp_auth_gateway.auth")
 
@@ -40,11 +43,16 @@ class TokenError(Exception):
 
 
 class TokenValidator:
-    """One per process, around a cached ``PyJWKClient``.
+    """One per app, around a cached ``PyJWKClient``.
 
     Within the cache lifespan a token signed by a freshly rotated key would fail to
     resolve, so a miss triggers one forced refresh and a retry, rate-limited by
     ``jwks_refresh_min_interval``.
+
+    :meth:`validate` blocks while the JWK set is fetched, so a caller on an event
+    loop runs it on a worker thread. It is safe to call from several at once:
+    PyJWKClient (2.14 and later) fetches under a lock and cools down between
+    forced refreshes, and the refresh here takes a lock of its own.
     """
 
     def __init__(
@@ -64,6 +72,7 @@ class TokenValidator:
         self._jwk_client = self._new_client()
         # -inf so the first forced refresh is never throttled on a freshly booted host.
         self._last_refresh = float("-inf")
+        self._refresh_lock = threading.Lock()
 
     def _new_client(self) -> PyJWKClient:
         return PyJWKClient(
@@ -74,23 +83,26 @@ class TokenValidator:
 
     def _refresh_jwks(self) -> bool:
         """Drop the cached JWK set, at most once per ``jwks_refresh_min_interval``."""
-        now = time.monotonic()
-        if now - self._last_refresh < settings.jwks_refresh_min_interval:
-            return False
-        self._last_refresh = now
-        self._jwk_client = self._new_client()  # a new client re-fetches on next use
-        return True
+        with self._refresh_lock:
+            now = time.monotonic()
+            if now - self._last_refresh < settings.jwks_refresh_min_interval:
+                return False
+            self._last_refresh = now
+            self._jwk_client = self._new_client()  # a new client re-fetches on next use
+            return True
 
-    def validate(self, token: str) -> dict:
+    def validate(self, token: str) -> Claims:
         """Return the verified claims, or raise :class:`TokenError`."""
+        client = self._jwk_client
         try:
-            signing_key = self._jwk_client.get_signing_key_from_jwt(token)
+            signing_key = client.get_signing_key_from_jwt(token)
         except PyJWKClientError as exc:
             # Possibly a rotated key not yet cached: one throttled refresh, then retry.
-            if self._refresh_jwks():
+            # A refresh another validation made since the miss counts as this one's.
+            if self._refresh_jwks() or self._jwk_client is not client:
                 try:
                     signing_key = self._jwk_client.get_signing_key_from_jwt(token)
-                except Exception as exc2:  # noqa: BLE001 — any failure → invalid_token
+                except Exception as exc2:  # any failure → invalid_token
                     logger.warning("signing key resolution failed after refresh: %s", exc2)
                     raise TokenError(_KEY_RESOLUTION_ERROR) from exc2
             else:
@@ -117,16 +129,11 @@ class TokenValidator:
             raise TokenError("token issuer is not the configured tenant") from exc
         except jwt.InvalidTokenError as exc:  # signature, alg, missing claim, etc.
             raise TokenError(f"invalid token: {exc}") from exc
+        except (jwt.PyJWTError, TypeError) as exc:
+            # The unverified kid named a JWKS key of another type than the token's alg;
+            # PyJWT raises TypeError or InvalidKeyError for that, not InvalidTokenError.
+            logger.warning("signing key does not fit the token's alg: %s", exc)
+            raise TokenError("token signing key does not match its algorithm") from exc
 
-        return claims
-
-
-_validator: TokenValidator | None = None
-
-
-def get_validator() -> TokenValidator:
-    """The process-wide validator, built on first use so auth-off runs never need JWKS config."""
-    global _validator
-    if _validator is None:
-        _validator = TokenValidator()
-    return _validator
+        # Signed by the tenant and checked for iss, aud and exp; ``Claims`` types the rest.
+        return cast(Claims, claims)

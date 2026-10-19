@@ -7,6 +7,14 @@ import json
 import httpx
 
 
+class CutOffStream(httpx.AsyncByteStream):
+    """A response body the peer drops partway through."""
+
+    async def __aiter__(self):
+        yield b'{"jsonrpc":"2.0","id":1,"result":{"tools":['
+        raise httpx.RemoteProtocolError("peer closed connection mid-body")
+
+
 def fake_upstream(name: str, tools: list[str], session_id: str, *, sse: bool = False):
     """A minimal Streamable HTTP MCP server as a respx side-effect."""
 

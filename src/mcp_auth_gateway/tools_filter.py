@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from typing import Any
 
 from . import jsonrpc
 
@@ -21,7 +22,7 @@ def is_tools_list_request(body: bytes) -> bool:
         return False
     try:
         doc = json.loads(body)
-    except (ValueError, TypeError):
+    except ValueError:
         return False
     entries = doc if isinstance(doc, list) else [doc]
     return any(isinstance(e, dict) and e.get("method") == "tools/list" for e in entries)
@@ -59,10 +60,10 @@ def _filter_sse(raw: bytes, allowed: set[str]) -> bytes:
     return jsonrpc.rewrite_sse_data(raw, lambda msg: _filter_message(msg, allowed))
 
 
-def extract_tools(raw: bytes, content_type: str | None) -> list[dict]:
+def extract_tools(raw: bytes, content_type: str | None) -> list[dict[str, Any]]:
     """The tool entries in a ``tools/list`` response body. Observation only (manifest
     pinning), never a boundary: a parse failure yields ``[]``."""
-    tools: list[dict] = []
+    tools: list[dict[str, Any]] = []
     for msg in jsonrpc.parse_messages(raw, content_type):
         if not isinstance(msg, dict):
             continue
@@ -87,6 +88,6 @@ def filter_tools_list_response(
             return _filter_sse(raw, allowed_set)
         if "application/json" in ct:
             return _filter_json(raw, allowed_set)
-    except (ValueError, TypeError, UnicodeDecodeError):
+    except ValueError:  # includes UnicodeDecodeError
         return raw
     return raw

@@ -1,12 +1,16 @@
 """Demo client — Entra ID device-code login, then a real call through the gateway.
 
 Run it twice for the 90-second demo:
-  * sign in as the **analyst** user  -> the SELECT succeeds (real rows)
+  * sign in as the **analyst** user  -> the gateway answers the SELECT with a
+    step-up challenge (execute_sql is a destructive tool), the client signs in
+    again carrying Entra's claims challenge, MFA runs, and the retried SELECT
+    succeeds (real rows)
   * sign in as the **readonly** user -> the same call is rejected (403)
 
-Both runs authenticate the same way; the gateway decides allow/deny from the
-token's Entra group claim and writes an audit line either way. The token and the
-query arguments never leave the gateway — only redacted audit metadata could.
+Both runs authenticate the same way; the gateway decides allow / deny / step-up
+from the token's Entra group claim and ``acrs`` context and writes an audit line
+for every outcome. The token and the query arguments never leave the gateway —
+only redacted audit metadata could.
 
 Sign-in is cached (encrypted at rest where the OS supports it — DPAPI on
 Windows), so you authenticate once and later runs refresh silently; the
@@ -33,6 +37,7 @@ import sys
 from pathlib import Path
 
 import anyio
+import httpx
 import msal
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -98,7 +103,7 @@ def _build_token_cache() -> PersistedTokenCache:
     file otherwise (e.g. headless Linux), with a warning."""
     try:
         persistence = build_encrypted_persistence(TOKEN_CACHE_PATH)
-    except Exception:  # noqa: BLE001 — no OS keystore available; degrade rather than fail
+    except Exception:  # no OS keystore available; degrade rather than fail
         print("  (token cache not OS-encrypted here — falling back to a plaintext file)")
         persistence = FilePersistence(TOKEN_CACHE_PATH)
     return PersistedTokenCache(persistence)
@@ -162,28 +167,82 @@ def _login(claims_challenge: str | None = None) -> str:
     return result["access_token"]
 
 
-async def _call_through_gateway(token: str) -> None:
-    """Call the demo tool through the gateway with the bearer token."""
+def _http_error(exc: BaseException) -> httpx.HTTPStatusError | None:
+    """The ``HTTPStatusError`` inside an exception (group) the MCP client raised, if any."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc
+    if isinstance(exc, BaseExceptionGroup):
+        for inner in exc.exceptions:
+            found = _http_error(inner)
+            if found:
+                return found
+    return None
+
+
+def _step_up_acr(exc: BaseException) -> str | None:
+    """The authentication context a 401 step-up challenge asks for (RFC 9470), else None."""
+    err = _http_error(exc)
+    if err is None or err.response.status_code != 401:
+        return None
+    challenge = err.response.headers.get("www-authenticate", "")
+    if "insufficient_user_authentication" not in challenge:
+        return None
+    _, _, rest = challenge.partition('acr_values="')
+    acr, _, _ = rest.partition('"')
+    return acr or None
+
+
+async def _call_through_gateway(token: str) -> str | None:
+    """Call the demo tool through the gateway with the bearer token.
+
+    Returns the authentication context the gateway demanded when it answered with
+    a step-up challenge; None when the call was allowed or denied outright.
+    """
     headers = {"Authorization": f"Bearer {token}"}
     print(f"\nCalling {DEMO_TOOL} through the gateway at {GATEWAY_URL} ...")
     try:
-        async with streamablehttp_client(GATEWAY_URL, headers=headers) as (read, write, _):  # noqa: SIM117 — inner cm depends on outer's unpacked values
+        async with streamablehttp_client(GATEWAY_URL, headers=headers) as (
+            read,
+            write,
+            _,
+        ):  # inner cm depends on outer's unpacked values
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(DEMO_TOOL, DEMO_ARGS)
                 print("\n✅ ALLOWED — real result from upstream:")
                 for block in result.content:
                     print("  ", getattr(block, "text", block))
-    except Exception as exc:  # noqa: BLE001 — demo: any failure means "rejected"
-        print("\n⛔ REJECTED by the gateway — request never reached the database.")
-        print(f"   ({type(exc).__name__}: {exc})")
+    except Exception as exc:  # demo: classify, never crash
+        acr = _step_up_acr(exc)
+        if acr:
+            print(
+                f"\n🔐 STEP-UP required — the gateway wants authentication context {acr!r} (RFC 9470)."
+            )
+            print("   The request never reached the database; the challenge is logged.")
+            return acr
+        err = _http_error(exc)
+        if err is not None:
+            print(
+                f"\n⛔ REJECTED by the gateway (HTTP {err.response.status_code}) — request never reached the database."
+            )
+            print(f"   {err.response.text.strip()[:200]}")
+        else:
+            print("\n⛔ FAILED before the gateway answered.")
+            print(f"   ({type(exc).__name__}: {exc})")
 
     print("\nNow check the gateway's audit log: one structured line, arguments redacted.")
+    return None
 
 
 def main() -> None:
     token = _login()
-    anyio.run(_call_through_gateway, token)
+    acr = anyio.run(_call_through_gateway, token)
+    if acr:
+        print(
+            f"\nSigning in again with a claims challenge for {acr!r}; Entra will ask for the stronger factor ..."
+        )
+        token = _login(build_claims_challenge(acr))
+        anyio.run(_call_through_gateway, token)
 
 
 if __name__ == "__main__":

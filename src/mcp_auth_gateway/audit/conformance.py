@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from jsonschema import validators
+from jsonschema import ValidationError, validators
 
 _MAX_VIOLATIONS = 10
 _MAX_EXPECTED_LEN = 120
@@ -29,18 +29,15 @@ _MAX_UNEXPECTED_KEYS = 20
 
 def _expected(validator_value: Any) -> str:
     """Compact, truncated rendering of the schema's expectation (schema-side text only)."""
-    try:
-        text = json.dumps(validator_value, sort_keys=True, default=str)
-    except (TypeError, ValueError):
-        text = str(type(validator_value).__name__)
+    text = json.dumps(validator_value, sort_keys=True, default=str)
     if len(text) > _MAX_EXPECTED_LEN:
         text = text[:_MAX_EXPECTED_LEN] + "…"
     return text
 
 
-def _describe(err) -> dict:
+def _describe(err: ValidationError) -> dict[str, Any]:
     """One value-free violation; never ``err.message``, which interpolates the instance value."""
-    violation = {
+    violation: dict[str, Any] = {
         "path": err.json_path,
         "keyword": err.validator,
         "expected": _expected(err.validator_value),
@@ -55,7 +52,7 @@ def _describe(err) -> dict:
     return violation
 
 
-def check(schema: dict | None, arguments: Any) -> dict | None:
+def check(schema: dict[str, Any] | None, arguments: Any) -> dict[str, Any] | None:
     """The ``conformance`` block for a tool-call record, or ``None`` with no pinned schema.
 
     An invalid or unsupported schema yields ``{"schema_error": true}``; otherwise
@@ -72,12 +69,12 @@ def check(schema: dict | None, arguments: Any) -> dict | None:
             validator.iter_errors(arguments if arguments is not None else {}),
             key=lambda e: str(e.json_path),
         )
-    except Exception:  # noqa: BLE001 — telemetry must degrade, never fail the call
+    except Exception:  # telemetry must degrade, never fail the call
         return {"schema_conformant": None, "schema_error": True}
 
     if not errors:
         return {"schema_conformant": True}
-    result: dict = {
+    result: dict[str, Any] = {
         "schema_conformant": False,
         "violations": [_describe(e) for e in errors[:_MAX_VIOLATIONS]],
     }

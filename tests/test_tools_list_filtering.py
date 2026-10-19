@@ -14,15 +14,14 @@ import httpx
 import pytest
 import respx
 
-from mcp_auth_gateway import main
-from mcp_auth_gateway.auth.policy_resolver import Policy
+from mcp_auth_gateway.auth.policy_resolver import Policy, StepUpRequirement
 from mcp_auth_gateway.tools_filter import (
     extract_tools,
     filter_tools_list_response,
     is_tools_list_request,
 )
 
-from .conftest import ANALYST_GROUP, DENIED_GROUP
+from .conftest import ANALYST_GROUP, DENIED_GROUP, UPSTREAM
 
 # The nine tools the demo's postgres-mcp upstream actually advertises.
 ALL_TOOLS = [
@@ -38,11 +37,9 @@ ALL_TOOLS = [
 ]
 ANALYST_ALLOWED = ["list_schemas", "execute_sql"]
 
-UPSTREAM = "http://localhost:9000/mcp"
-
 _POLICY = Policy(
     groups={ANALYST_GROUP: ANALYST_ALLOWED, DENIED_GROUP: []},
-    destructive=["execute_sql"],
+    destructive={"execute_sql": StepUpRequirement("c1", 300)},
 )
 
 
@@ -253,10 +250,9 @@ def test_proxy_tools_list_still_reaches_upstream(legacy_client, make_token):
     assert "authorization" not in {k.lower() for k in route.calls.last.request.headers}
 
 
-def test_proxy_does_not_filter_when_auth_disabled(legacy_client, make_token, monkeypatch):
+def test_proxy_does_not_filter_when_auth_disabled(gateway_client, policy):
     """Auth off: no identity to filter by, so the full list passes."""
-    monkeypatch.setattr(main.settings, "auth_enabled", False)
-    with respx.mock:
+    with gateway_client("single", policy, auth_enabled=False) as client, respx.mock:
         respx.post(UPSTREAM).mock(
             return_value=httpx.Response(
                 200,
@@ -264,7 +260,7 @@ def test_proxy_does_not_filter_when_auth_disabled(legacy_client, make_token, mon
                 headers={"content-type": "application/json"},
             )
         )
-        resp = legacy_client.post("/mcp", content=_tools_list_request())
+        resp = client.post("/mcp", content=_tools_list_request())
     assert _names_in(resp.content) == ALL_TOOLS
 
 

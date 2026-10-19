@@ -7,36 +7,28 @@ import json
 import pytest
 
 from mcp_auth_gateway.audit import export, structure, verify, writer
-
-
-@pytest.fixture(autouse=True)
-def _reset_chain():
-    writer._chain["path"] = None
-    writer._chain["last_hash"] = None
-    yield
-
+from mcp_auth_gateway.evidence import signals
 
 # --- tamper-evidence (hash chain) ------------------------------------------
 
 
-def _write_n(path, n):
+def _write_n(log, n):
+    audit_log = writer.AuditLog(log)
     for i in range(n):
-        writer.record(
+        audit_log.record(
             writer.AuditEvent(outcome="allowed", tool=f"tool_{i}", correlation_id=f"c{i}")
         )
 
 
-def test_intact_chain_verifies(tmp_path, monkeypatch):
+def test_intact_chain_verifies(tmp_path):
     log = tmp_path / "audit.log"
-    monkeypatch.setattr(writer.settings, "audit_log_path", str(log))
     _write_n(log, 5)
     result = verify.verify_file(log)
     assert result.ok and result.records == 5
 
 
-def test_edited_record_breaks_chain(tmp_path, monkeypatch):
+def test_edited_record_breaks_chain(tmp_path):
     log = tmp_path / "audit.log"
-    monkeypatch.setattr(writer.settings, "audit_log_path", str(log))
     _write_n(log, 5)
 
     # Tamper: flip a field in record 2 (0-indexed) without fixing its hash.
@@ -52,9 +44,8 @@ def test_edited_record_breaks_chain(tmp_path, monkeypatch):
     assert "modified" in result.detail
 
 
-def test_deleted_record_breaks_chain(tmp_path, monkeypatch):
+def test_deleted_record_breaks_chain(tmp_path):
     log = tmp_path / "audit.log"
-    monkeypatch.setattr(writer.settings, "audit_log_path", str(log))
     _write_n(log, 5)
 
     lines = log.read_text(encoding="utf-8").splitlines()
@@ -66,19 +57,59 @@ def test_deleted_record_breaks_chain(tmp_path, monkeypatch):
     assert "chain" in result.detail  # prev_hash linkage break
 
 
-def test_chain_survives_restart(tmp_path, monkeypatch):
+def test_swapped_records_break_chain(tmp_path):
+    log = tmp_path / "audit.log"
+    _write_n(log, 5)
+
+    lines = log.read_text(encoding="utf-8").splitlines()
+    lines[1], lines[2] = lines[2], lines[1]  # reorder to change what happened first
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = verify.verify_file(log)
+    assert not result.ok
+    assert result.broken_line == 2
+
+
+def test_tail_truncation_is_invisible_to_the_chain_alone(tmp_path):
+    """Dropping the last records leaves a valid prefix. Only an anchor kept elsewhere
+    (an attestation pack's terminal_record_hash) shows that records are missing."""
+    log = tmp_path / "audit.log"
+    _write_n(log, 5)
+    terminal = json.loads(log.read_text(encoding="utf-8").splitlines()[-1])["integrity"]
+
+    lines = log.read_text(encoding="utf-8").splitlines()[:3]
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = verify.verify_file(log)
+    assert result.ok and result.records == 3
+    assert json.loads(lines[-1])["integrity"]["record_hash"] != terminal["record_hash"]
+
+
+def test_chain_survives_restart(tmp_path):
     """A new process (simulated by resetting in-memory chain state) continues the
     existing chain by seeding from the log tail, rather than forking it."""
     log = tmp_path / "audit.log"
-    monkeypatch.setattr(writer.settings, "audit_log_path", str(log))
     _write_n(log, 3)
 
-    writer._chain["path"] = None  # simulate a restart
-    writer._chain["last_hash"] = None
-    writer.record(writer.AuditEvent(outcome="allowed", tool="after_restart", correlation_id="c99"))
+    restarted = writer.AuditLog(log)  # a new process, same log
+    restarted.record(
+        writer.AuditEvent(outcome="allowed", tool="after_restart", correlation_id="c99")
+    )
 
     result = verify.verify_file(log)
     assert result.ok and result.records == 4
+
+
+def test_corrupt_tail_starts_a_new_chain(tmp_path):
+    # A tail that is not a record, or whose record_hash is not a string, seeds
+    # genesis rather than crashing the writer or chaining to a non-hash.
+    log = tmp_path / "audit.log"
+    for tail in ('{"integrity": {"record_hash": 5}}', "not json"):
+        log.write_text(tail + "\n", encoding="utf-8")
+        rec = writer.AuditLog(log).record(
+            writer.AuditEvent(outcome="allowed", tool="t", correlation_id="c")
+        )
+        assert rec["integrity"]["prev_hash"] == writer.GENESIS
 
 
 # --- structural metadata (leak-safe) ---------------------------------------
@@ -141,10 +172,33 @@ def test_no_arguments_returns_none():
 # --- SIEM export ------------------------------------------------------------
 
 
-def test_export_flattens_attribution_and_structure(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "rec",
+    [
+        {"actor": "x"},
+        {"actor": {"agent": "y", "on_behalf_of": 5}},
+        {"actor": {"agent": {"app_id": ["a"]}, "on_behalf_of": {"oid": {"x": 1}}}},
+        {"arguments": 5},
+        {"arguments": {"structure": "s", "conformance": {"violations": 5}}},
+        {"manifest": [], "channel": "c", "integrity": 1},
+    ],
+)
+def test_a_field_of_the_wrong_type_reads_as_absent(rec):
+    # A record can chain-verify and still not have the writer's shape (another
+    # writer, an old schema). Every reader still produces its row and its counts.
+    sentinel = export.flatten_record(rec)
+    ocsf = export.flatten_record_ocsf(rec)
+    sig = signals.aggregate([rec])
+    json.dumps([sentinel, ocsf])
+    assert sentinel["ArgKind"] is None
+    assert sentinel["SchemaViolationKeywords"] is None
+    assert (sig.total_records, sig.records_with_agent, sig.records_with_human) == (1, 0, 0)
+    assert sig.structured_records == 0
+
+
+def test_export_flattens_attribution_and_structure(tmp_path):
     log = tmp_path / "audit.log"
-    monkeypatch.setattr(writer.settings, "audit_log_path", str(log))
-    writer.record(
+    writer.AuditLog(log).record(
         writer.AuditEvent(
             outcome="allowed",
             tool="postgres__execute_sql",

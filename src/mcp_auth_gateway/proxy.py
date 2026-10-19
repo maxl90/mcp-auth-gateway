@@ -9,18 +9,19 @@ tools; everything else streams through untouched.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 
 import httpx
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import naming, upstreams
-from .audit import manifest as audit_manifest
+from . import naming, state
 from .auth import enforce
+from .auth.claims import Claims
 from .config import settings
-from .http_util import ResponseTooLarge, read_capped
+from .http_util import BodyTooLarge, read_capped, read_request_body
 from .tools_filter import extract_tools, filter_tools_list_response, is_tools_list_request
 
 # Server-side log for operational detail that must NOT reach clients (internal
@@ -29,7 +30,8 @@ logger = logging.getLogger("mcp_auth_gateway")
 
 
 # Hop-by-hop headers (RFC 9110 §7.6.1) plus content-length/host, which the HTTP
-# client and ASGI server recompute. Forwarding these corrupts the stream.
+# client and ASGI server recompute. Forwarding these corrupts the stream. A message
+# can name more in its Connection field; see _connection_options.
 _HOP_BY_HOP = frozenset(
     {
         "connection",
@@ -46,10 +48,35 @@ _HOP_BY_HOP = frozenset(
 )
 
 
-# The gateway terminates the user's token: it is validated here and MUST NOT be
-# forwarded upstream. Stripping it is the trust boundary in code form — the
-# upstream MCP server connects to the database with its own service identity.
-_STRIP_ON_FORWARD = frozenset({"authorization"})
+# Set by the gateway's own server on every response; relaying the upstream's
+# copies would send two of each.
+_SERVER_OWNED = frozenset({"date", "server"})
+
+# The gateway terminates the caller's credentials and is the client the upstream
+# sees. The token and its DPoP proof are validated here and MUST NOT be forwarded:
+# stripping them is the trust boundary in code form, and the upstream MCP server
+# reaches its resource with its own service identity. Cookies and client-chosen
+# forwarding or edge-identity headers stop here too: an upstream that read them
+# would see values the caller picked, arriving from the gateway's address.
+_STRIP_ON_FORWARD = frozenset({"authorization", "dpop", "cookie", "forwarded", "x-real-ip"})
+_STRIP_PREFIXES_ON_FORWARD = ("x-forwarded-", "x-client-cert-")
+
+
+# RFC 3986 unreserved characters: nothing an upstream could decode or reinterpret.
+_SUBPATH_SEGMENT = re.compile(r"[A-Za-z0-9._~-]*")
+
+
+def is_safe_subpath(subpath: str) -> bool:
+    """False for a subpath that could leave the upstream endpoint it is appended to.
+
+    The route receives the path percent-decoded once, so ``..%2F`` arrives as ``../``
+    and ``%3F`` as ``?``. Each segment must be unreserved characters and not ``.`` or
+    ``..``. That also refuses a second layer of encoding (``%2e%2e``, which an upstream
+    decodes to ``..``), ``;`` path parameters, backslashes and control characters."""
+    return all(
+        _SUBPATH_SEGMENT.fullmatch(segment) and segment not in (".", "..")
+        for segment in subpath.split("/")
+    )
 
 
 def _forward_url(request: Request, target: str) -> httpx.URL:
@@ -59,52 +86,77 @@ def _forward_url(request: Request, target: str) -> httpx.URL:
     return url
 
 
+def _connection_options(values: Iterable[str]) -> frozenset[str]:
+    """The header names a ``Connection`` field lists (RFC 9110 §7.6.1). Each is
+    hop-by-hop for that one message, so a proxy forwards none of them."""
+    return frozenset(
+        option.strip().lower() for value in values for option in value.split(",") if option.strip()
+    )
+
+
 def _forward_headers(request: Request) -> dict[str, str]:
-    """Headers to send upstream: drop hop-by-hop ones and — the trust boundary —
-    the caller's already-validated ``Authorization``."""
+    """Headers to send upstream: all but the hop-by-hop ones (fixed, and those the
+    request's Connection field names) and what the gateway terminates (the trust
+    boundary, see ``_STRIP_ON_FORWARD``)."""
+    per_hop = _connection_options(request.headers.getlist("connection"))
     return {
         k: v
         for k, v in request.headers.items()
-        if k.lower() not in _HOP_BY_HOP and k.lower() not in _STRIP_ON_FORWARD
+        if (name := k.lower()) not in _HOP_BY_HOP
+        and name not in per_hop
+        and name not in _STRIP_ON_FORWARD
+        and not name.startswith(_STRIP_PREFIXES_ON_FORWARD)
     }
 
 
 def _response_headers(upstream: httpx.Response) -> dict[str, str]:
     """Upstream response headers to return (incl. mcp-session-id), minus
-    hop-by-hop and content-type. content-length is hop-by-hop here, so it's
+    hop-by-hop (fixed, and those the response's Connection field names),
+    server-owned and content-type. content-length is hop-by-hop here, so it's
     dropped and recomputed from the (possibly rewritten) body."""
+    per_hop = _connection_options(upstream.headers.get_list("connection"))
     return {
         k: v
         for k, v in upstream.headers.items()
-        if k.lower() not in _HOP_BY_HOP and k.lower() != "content-type"
+        if (name := k.lower()) not in _HOP_BY_HOP
+        and name not in per_hop
+        and name not in _SERVER_OWNED
+        and name != "content-type"
     }
 
 
-async def _forward(request: Request, target: str, body: bytes) -> Response:
-    """Forward one request to ``target`` and stream the response back verbatim.
+def _bad_gateway(error: str, detail: str) -> JSONResponse:
+    return JSONResponse({"error": error, "detail": detail}, status_code=502)
 
-    ``body`` was already read by the enforcement step. The caller's ``Authorization``
-    header is dropped here: the gateway has validated and terminated the token.
+
+async def _send(request: Request, target: str, body: bytes) -> httpx.Response | JSONResponse:
+    """Send the caller's request to ``target`` and return the streamed upstream
+    response, or a 502 when it cannot be sent (refused, timed out, reset).
+
+    ``body`` was already read by the enforcement step. The caller's credentials are
+    dropped here: the gateway has validated and terminated them.
     """
-    client: httpx.AsyncClient = request.app.state.client
-
-    url = _forward_url(request, target)
-    fwd_headers = _forward_headers(request)
-
-    upstream_req = client.build_request(request.method, url, headers=fwd_headers, content=body)
+    client = state.of(request).client
+    upstream_req = client.build_request(
+        request.method,
+        _forward_url(request, target),
+        headers=_forward_headers(request),
+        content=body,
+    )
     try:
-        upstream = await client.send(upstream_req, stream=True)
-    except httpx.ConnectError as exc:
+        return await client.send(upstream_req, stream=True)
+    except httpx.HTTPError as exc:
         # Detail (internal URL + exception text) goes to the server log only —
         # the client-facing body must not leak internal topology.
         logger.error("upstream unreachable: %s (%s)", target, exc)
-        return JSONResponse(
-            {
-                "error": "upstream_unreachable",
-                "detail": "the upstream MCP server could not be reached",
-            },
-            status_code=502,
-        )
+        return _bad_gateway("upstream_unreachable", "the upstream MCP server could not be reached")
+
+
+async def _forward(request: Request, target: str, body: bytes) -> Response:
+    """Forward one request to ``target`` and stream the response back verbatim."""
+    upstream = await _send(request, target, body)
+    if isinstance(upstream, JSONResponse):
+        return upstream
 
     media_type = upstream.headers.get("content-type")
     resp_headers = _response_headers(upstream)
@@ -131,7 +183,7 @@ async def _forward_filtered(
     allowed: set[str],
     *,
     correlation_id: str,
-    claims: dict | None,
+    claims: Claims | None,
     manifest_upstream: str | None = None,
 ) -> Response:
     """Forward a ``tools/list`` request and filter the response to ``allowed``.
@@ -140,42 +192,28 @@ async def _forward_filtered(
     ``MAX_UPSTREAM_RESPONSE_BYTES``) to rewrite it. The unfiltered catalog is also
     observed for manifest pinning, keyed under ``manifest_upstream`` when given.
     """
-    client: httpx.AsyncClient = request.app.state.client
-    upstream_req = client.build_request(
-        request.method,
-        _forward_url(request, target),
-        headers=_forward_headers(request),
-        content=body,
-    )
-    try:
-        upstream = await client.send(upstream_req, stream=True)
-    except httpx.ConnectError as exc:
-        logger.error("upstream unreachable: %s (%s)", target, exc)
-        return JSONResponse(
-            {
-                "error": "upstream_unreachable",
-                "detail": "the upstream MCP server could not be reached",
-            },
-            status_code=502,
-        )
+    upstream = await _send(request, target, body)
+    if isinstance(upstream, JSONResponse):
+        return upstream
 
     try:
-        raw = await read_capped(upstream, settings.max_upstream_response_bytes)
-    except ResponseTooLarge as exc:
+        raw = await read_capped(upstream.aiter_bytes(), settings.max_upstream_response_bytes)
+    except BodyTooLarge as exc:
         logger.error("upstream response too large: %s (%s)", target, exc)
-        return JSONResponse(
-            {
-                "error": "upstream_response_too_large",
-                "detail": "the upstream response exceeded the configured size cap",
-            },
-            status_code=502,
+        return _bad_gateway(
+            "upstream_response_too_large", "the upstream response exceeded the configured size cap"
+        )
+    except httpx.HTTPError as exc:
+        logger.error("upstream response unreadable: %s (%s)", target, exc)
+        return _bad_gateway(
+            "upstream_response_incomplete", "the upstream response could not be read in full"
         )
     finally:
         await upstream.aclose()
 
     catalog = extract_tools(raw, upstream.headers.get("content-type"))
     if catalog:
-        audit_manifest.observe_catalog(
+        state.of(request).manifests.observe_catalog(
             manifest_upstream, catalog, correlation_id=correlation_id, claims=claims
         )
 
@@ -191,20 +229,21 @@ async def _forward_filtered(
 async def single_upstream(request: Request, target: str) -> Response:
     """Single-upstream proxy: enforce, then forward, filtering a ``tools/list``
     response to the caller's permitted tools."""
-    body = await request.body()
+    body = await read_request_body(request)
+    if isinstance(body, Response):
+        return body
     correlation_id = uuid.uuid4().hex
-    guard, claims = await enforce.enforce(request, body, correlation_id)
+    guard, admitted = await enforce.enforce(request, body, correlation_id)
     if guard is not None:
         return guard
-    if claims is not None and is_tools_list_request(body):
-        allowed = enforce.allowed_tools(claims)
+    if admitted is not None and is_tools_list_request(body):
         return await _forward_filtered(
             request,
             target,
             body,
-            allowed,
+            admitted.allowed_tools(),
             correlation_id=correlation_id,
-            claims=claims,
+            claims=admitted.claims,
         )
     return await _forward(request, target, body)
 
@@ -214,7 +253,7 @@ async def path_routed(request: Request, subpath: str) -> Response:
     upstream. Wire tool names are the upstream's own, so RBAC and audit prefix
     them; the same namespaced policy governs both routes."""
     name, _, rest = subpath.partition("/")
-    upstream = upstreams.get_upstream(name)
+    upstream = state.of(request).upstreams.get(name)
     if upstream is None:
         return JSONResponse(
             {"error": "unknown_upstream", "detail": f"no upstream named '{name}'"},
@@ -222,9 +261,11 @@ async def path_routed(request: Request, subpath: str) -> Response:
         )
     target = f"{upstream.url}/{rest}" if rest else upstream.url
 
-    body = await request.body()
+    body = await read_request_body(request)
+    if isinstance(body, Response):
+        return body
     correlation_id = uuid.uuid4().hex
-    guard, claims = await enforce.enforce(
+    guard, admitted = await enforce.enforce(
         request,
         body,
         correlation_id,
@@ -233,10 +274,10 @@ async def path_routed(request: Request, subpath: str) -> Response:
     )
     if guard is not None:
         return guard
-    if claims is not None and is_tools_list_request(body):
+    if admitted is not None and is_tools_list_request(body):
         # The upstream answers with its own (un-namespaced) tool names; project
         # the caller's namespaced allow-set down to this upstream's slice.
-        namespaced = enforce.allowed_tools(claims)
+        namespaced = admitted.allowed_tools()
         allowed = {
             split[1]
             for split in map(naming.split_namespaced, namespaced)
@@ -248,7 +289,7 @@ async def path_routed(request: Request, subpath: str) -> Response:
             body,
             allowed,
             correlation_id=correlation_id,
-            claims=claims,
+            claims=admitted.claims,
             manifest_upstream=name,
         )
     return await _forward(request, target, body)

@@ -16,11 +16,9 @@ from mcp_auth_gateway import main
 from mcp_auth_gateway.auth.policy_resolver import Policy
 from mcp_auth_gateway.upstreams import Upstream
 
-from .conftest import ANALYST_GROUP
+from .conftest import ANALYST_GROUP, PG_URL
 
-PG_URL = "http://pg-upstream:9000/mcp"
-
-_POLICY = Policy(groups={ANALYST_GROUP: ["postgres__list_schemas"]}, destructive={})
+_POLICY = Policy(groups={ANALYST_GROUP: ["postgres__list_schemas"]})
 
 
 @pytest.fixture

@@ -6,6 +6,7 @@ import zipfile
 
 import pytest
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from mcp_auth_gateway.audit.writer import GENESIS, compute_hash
 from mcp_auth_gateway.evidence.attestation import (
@@ -46,6 +47,17 @@ def _rec(ts, outcome="allowed", tool="postgres__execute_sql"):
             "conformance": {"schema_conformant": True},
         },
     }
+
+
+def _rewrite(zip_path, **members):
+    """Rewrite the pack with each named member replaced (``None`` drops it)."""
+    with zipfile.ZipFile(zip_path) as zf:
+        current = {n: zf.read(n) for n in zf.namelist()}
+    current.update(members)
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        for name, data in current.items():
+            if data is not None:
+                zf.writestr(name, data)
 
 
 def _write_chained_log(path, contents):
@@ -112,13 +124,9 @@ def test_tampered_member_fails_verification(log, tmp_path):
     out = tmp_path / "pack.zip"
     build_pack(p, out)
 
-    # Rewrite the zip with one member altered.
     with zipfile.ZipFile(out) as zf:
-        members = {n: zf.read(n) for n in zf.namelist()}
-    members["export.sentinel.jsonl"] = members["export.sentinel.jsonl"] + b'{"forged":1}\n'
-    with zipfile.ZipFile(out, "w") as zf:
-        for n, b in members.items():
-            zf.writestr(n, b)
+        rows = zf.read("export.sentinel.jsonl")
+    _rewrite(out, **{"export.sentinel.jsonl": rows + b'{"forged":1}\n'})
 
     ok, problems = verify_pack(out)
     assert not ok
@@ -130,12 +138,8 @@ def test_tampered_audit_log_fails_chain_recheck(log, tmp_path):
     out = tmp_path / "pack.zip"
     build_pack(p, out)
     with zipfile.ZipFile(out) as zf:
-        members = {n: zf.read(n) for n in zf.namelist()}
-    tampered = members["audit.log"].replace(b'"allowed"', b'"denied"', 1)
-    members["audit.log"] = tampered
-    with zipfile.ZipFile(out, "w") as zf:
-        for n, b in members.items():
-            zf.writestr(n, b)
+        audit_log = zf.read("audit.log")
+    _rewrite(out, **{"audit.log": audit_log.replace(b'"allowed"', b'"denied"', 1)})
 
     ok, problems = verify_pack(out)
     assert not ok
@@ -175,13 +179,9 @@ def test_signature_roundtrip_and_manifest_tamper_detection(log, tmp_path):
 
     # Alter the manifest inside the zip: signature must fail.
     with zipfile.ZipFile(out) as zf:
-        members = {n: zf.read(n) for n in zf.namelist()}
-    doctored = json.loads(members["pack-manifest.json"])
+        doctored = json.loads(zf.read("pack-manifest.json"))
     doctored["window"]["from"] = "2026-01-01"
-    members["pack-manifest.json"] = json.dumps(doctored, indent=2).encode("utf-8")
-    with zipfile.ZipFile(out, "w") as zf:
-        for n, b in members.items():
-            zf.writestr(n, b)
+    _rewrite(out, **{"pack-manifest.json": json.dumps(doctored, indent=2).encode("utf-8")})
     ok, problems = verify_pack(out)
     assert not ok
     assert any("signature verification FAILED" in x for x in problems)
@@ -207,7 +207,129 @@ def test_broken_chain_still_packs_and_says_so(log, tmp_path):
     assert ok, problems
 
 
-def test_console_bundle_shape_and_baseline_inclusion(log, tmp_path):
+def test_a_log_line_that_is_not_an_object_packs_as_a_broken_chain(log, tmp_path):
+    p, _ = log
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write("[1]\n")
+    manifest = build_pack(p, tmp_path / "pack.zip")
+    assert manifest["chain"]["ok"] is False
+    assert manifest["chain"]["detail"] == "line 4: not a JSON object"
+
+
+def test_a_manifest_that_is_not_an_object_fails_verification(log, tmp_path):
+    p, _ = log
+    out = tmp_path / "pack.zip"
+    build_pack(p, out)
+    _rewrite(out, **{"pack-manifest.json": b"[]"})
+    assert verify_pack(out) == (False, ["pack-manifest.json is not a JSON object"])
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "problem"),
+    [
+        ("files", [1], "files must be a list of objects that each name a member"),
+        ("files", 5, "files must be a list of objects that each name a member"),
+        ("signature", "x", "signature must be an object or null"),
+        ("chain", 5, "chain must be an object"),
+    ],
+)
+def test_a_manifest_field_of_the_wrong_shape_fails_verification(
+    log, tmp_path, field, value, problem
+):
+    p, _ = log
+    out = tmp_path / "pack.zip"
+    build_pack(p, out)
+    with zipfile.ZipFile(out) as zf:
+        manifest = json.loads(zf.read("pack-manifest.json"))
+    manifest[field] = value
+    _rewrite(out, **{"pack-manifest.json": json.dumps(manifest).encode("utf-8")})
+    assert verify_pack(out) == (False, [f"pack-manifest.json: {problem}"])
+
+
+def test_a_missing_member_and_a_missing_log_are_named(log, tmp_path):
+    p, _ = log
+    out = tmp_path / "pack.zip"
+    build_pack(p, out)
+    _rewrite(out, **{"VERIFY.md": None, "audit.log": None})
+    ok, problems = verify_pack(out)
+    assert not ok
+    assert "listed member missing from zip: VERIFY.md" in problems
+    assert "audit.log missing from pack" in problems
+
+
+@pytest.mark.parametrize(
+    ("manifest", "problem"),
+    [(None, "missing pack-manifest.json"), (b"{", "pack-manifest.json is not valid JSON")],
+)
+def test_an_unreadable_manifest_fails_verification(log, tmp_path, manifest, problem):
+    p, _ = log
+    out = tmp_path / "pack.zip"
+    build_pack(p, out)
+    _rewrite(out, **{"pack-manifest.json": manifest})
+    ok, problems = verify_pack(out)
+    assert not ok
+    assert len(problems) == 1
+    assert problems[0].startswith(problem)
+
+
+def test_a_stray_signature_on_an_unsigned_pack_is_a_problem(log, tmp_path):
+    p, _ = log
+    out = tmp_path / "pack.zip"
+    build_pack(p, out)
+    _rewrite(out, **{"pack-manifest.sig": b"AAAA"})
+    assert verify_pack(out) == (
+        False,
+        ["pack-manifest.sig present but manifest declares no signature"],
+    )
+
+
+def test_a_signed_pack_missing_its_signature_or_its_key_fails(log, tmp_path):
+    p, _ = log
+    key = tmp_path / "signing.pem"
+    generate_key(key)
+    out = tmp_path / "pack.zip"
+    build_pack(p, out, PackOptions(signing_key=key))
+    with zipfile.ZipFile(out) as zf:
+        manifest = json.loads(zf.read("pack-manifest.json"))
+
+    _rewrite(out, **{"pack-manifest.sig": None})
+    assert verify_pack(out) == (
+        False,
+        ["manifest declares a signature but pack-manifest.sig is missing"],
+    )
+    manifest["signature"] = {"algorithm": "ed25519"}
+    _rewrite(out, **{"pack-manifest.json": json.dumps(manifest).encode("utf-8")})
+    assert verify_pack(out) == (False, ["manifest signature block carries no public key"])
+
+
+def test_a_window_leaves_out_records_it_cannot_place_in_time(tmp_path):
+    p = tmp_path / "audit.log"
+    _write_chained_log(
+        p,
+        [_rec("2026-07-01T10:00:00.000+00:00"), {**_rec("x"), "ts": None}, _rec("not-a-time")],
+    )
+    manifest = build_pack(p, tmp_path / "pack.zip", PackOptions(from_ts="2026-07-01"))
+    assert (manifest["window"]["records"], manifest["source"]["total_records"]) == (1, 3)
+
+
+def test_a_record_whose_fields_have_the_wrong_type_still_packs(tmp_path):
+    p = tmp_path / "audit.log"
+    odd = {**_rec("2026-07-02T10:00:00.000+00:00"), "actor": "x", "arguments": 5}
+    _write_chained_log(p, [_rec("2026-07-01T10:00:00.000+00:00"), odd])
+    manifest = build_pack(p, tmp_path / "pack.zip")
+    assert manifest["chain"]["ok"] is True
+    assert manifest["window"]["records"] == 2
+
+
+def test_an_empty_log_packs_with_no_terminal_hash(tmp_path):
+    p = tmp_path / "audit.log"
+    p.write_text("", encoding="utf-8")
+    manifest = build_pack(p, tmp_path / "pack.zip")
+    assert manifest["chain"]["terminal_record_hash"] is None
+    assert manifest["window"]["records"] == 0
+
+
+def test_pack_includes_the_baseline_and_report_bundles(log, tmp_path):
     p, _ = log
     baseline = tmp_path / "manifest-baseline.json"
     baseline.write_text(json.dumps({"version": "1", "tools": {}}), encoding="utf-8")
@@ -217,8 +339,7 @@ def test_console_bundle_shape_and_baseline_inclusion(log, tmp_path):
     with zipfile.ZipFile(out) as zf:
         names = set(zf.namelist())
         report = json.loads(zf.read("evidence-report.eu-ai-act.json"))
-    # The pack's import contract: an audit*.log, an optional manifest-baseline*.json,
-    # and report bundles carrying these four keys.
+    # The full log, the baseline when one exists, and each report bundle's top-level keys.
     assert "audit.log" in names and "manifest-baseline.json" in names
     assert {"framework", "coverage", "signals", "controls"} <= set(report)
 
@@ -282,3 +403,17 @@ def test_pinning_an_unsigned_pack_is_a_problem(log, tmp_path):
     ok, problems = verify_pack(out, public_key="00" * 32)
     assert not ok
     assert any("no signature" in x for x in problems)
+
+
+def test_a_signing_key_that_is_not_ed25519_is_refused(log, tmp_path):
+    p, _ = log
+    key = tmp_path / "rsa.pem"
+    key.write_bytes(
+        rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    with pytest.raises(ValueError, match="must be an Ed25519 private key"):
+        build_pack(p, tmp_path / "pack.zip", PackOptions(signing_key=key))

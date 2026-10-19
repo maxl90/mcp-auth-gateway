@@ -45,3 +45,6 @@ Thumbs.db
 
 # Coverage data (pytest-cov)
 .coverage
+
+# Second-pass review scratch (tool output, findings)
+.review/

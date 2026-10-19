@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from mcp_auth_gateway.audit import writer
 
 _CLAIMS = {
@@ -17,15 +15,6 @@ _CLAIMS = {
     "azp": "agent-app-id-999",
     "app_displayname": "Demo Agent",
 }
-
-
-@pytest.fixture(autouse=True)
-def _reset_chain():
-    """Each test starts a fresh chain (the writer keys chain state by path; tests
-    use distinct tmp paths, but reset defensively)."""
-    writer._chain["path"] = None
-    writer._chain["last_hash"] = None
-    yield
 
 
 def test_record_captures_action_and_outcome():
@@ -100,11 +89,13 @@ def test_denied_record_carries_reason():
     assert rec["reason"] == "tool not permitted"
 
 
-def test_write_appends_chained_json_line(tmp_path, monkeypatch, capsys):
+def test_write_appends_chained_json_line(tmp_path, capsys):
     log = tmp_path / "audit.log"
-    monkeypatch.setattr(writer.settings, "audit_log_path", str(log))
-    writer.record(writer.AuditEvent(outcome="allowed", tool="list_schemas", correlation_id="cid1"))
-    writer.record(writer.AuditEvent(outcome="denied", tool="execute_sql", correlation_id="cid2"))
+    audit_log = writer.AuditLog(log)
+    audit_log.record(
+        writer.AuditEvent(outcome="allowed", tool="list_schemas", correlation_id="cid1")
+    )
+    audit_log.record(writer.AuditEvent(outcome="denied", tool="execute_sql", correlation_id="cid2"))
 
     lines = log.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2
@@ -115,3 +106,12 @@ def test_write_appends_chained_json_line(tmp_path, monkeypatch, capsys):
     assert r0["integrity"]["prev_hash"] == writer.GENESIS
     assert r1["integrity"]["prev_hash"] == r0["integrity"]["record_hash"]
     assert "list_schemas" in capsys.readouterr().out
+
+
+def test_sink_failure_is_logged_and_never_raises(tmp_path, caplog):
+    with caplog.at_level("ERROR", logger="mcp_auth_gateway.audit"):
+        rec = writer.AuditLog(tmp_path).record(  # a directory
+            writer.AuditEvent(outcome="allowed", tool="t", correlation_id="c")
+        )
+    assert rec["integrity"]["record_hash"]
+    assert "audit log write failed" in caplog.text
