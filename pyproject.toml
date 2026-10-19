@@ -1,6 +1,6 @@
 [project]
 name = "mcp-auth-gateway"
-version = "0.3.0"
+version = "0.3.1"
 description = "Open-source reverse proxy that puts enterprise identity in front of your MCP servers, without your data leaving the network."
 readme = "README.md"
 requires-python = ">=3.12"

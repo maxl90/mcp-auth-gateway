@@ -235,6 +235,58 @@ def test_partial_catalog_when_upstream_down(aggregate_client, make_token, tmp_pa
     assert degraded[0]["upstream"] == "postgres"
 
 
+def _outcomes(tmp_path) -> list[str]:
+    log = tmp_path / "audit.log"
+    if not log.exists():
+        return []
+    return [json.loads(line)["outcome"] for line in log.read_text().splitlines()]
+
+
+def test_a_call_on_an_expired_session_is_not_recorded_as_allowed(
+    aggregate_client, make_token, mock_upstreams, tmp_path
+):
+    # `allowed` means the call was forwarded. The session lookup bounces this one
+    # with a 404; its retry on a new session is forwarded and recorded, once.
+    token = make_token(groups=[ANALYST_GROUP])
+    call = _rpc("tools/call", {"name": "github__list_issues"})
+    auth = {"Authorization": f"Bearer {token}"}
+    stale = aggregate_client.post("/mcp", json=call, headers={**auth, "Mcp-Session-Id": "gone"})
+    assert stale.status_code == 404
+    assert _outcomes(tmp_path) == []
+
+    session = _initialize(aggregate_client, token)
+    retried = aggregate_client.post("/mcp", json=call, headers={**auth, "Mcp-Session-Id": session})
+    assert retried.status_code == 200
+    assert _outcomes(tmp_path) == ["allowed"]
+
+
+def test_a_batch_the_aggregator_refuses_is_not_recorded_as_allowed(
+    aggregate_client, make_token, tmp_path
+):
+    token = make_token(groups=[ANALYST_GROUP])
+    batch = [_rpc("tools/call", {"name": "github__list_issues"})]
+    resp = aggregate_client.post("/mcp", json=batch, headers={"Authorization": f"Bearer {token}"})
+    assert resp.json()["error"]["code"] == -32600
+    assert _outcomes(tmp_path) == []
+
+
+def test_a_call_to_an_upstream_down_since_initialize_is_not_recorded_as_allowed(
+    aggregate_client, make_token, tmp_path
+):
+    token = make_token(groups=[ANALYST_GROUP])
+    with respx.mock:
+        respx.route(url=PG_URL).mock(side_effect=httpx.ConnectError("down"))
+        respx.route(url=GH_URL).mock(side_effect=fake_upstream("github", GH_TOOLS, "gh-sess"))
+        session = _initialize(aggregate_client, token)
+        resp = aggregate_client.post(
+            "/mcp",
+            json=_rpc("tools/call", {"name": "postgres__list_schemas"}),
+            headers={"Authorization": f"Bearer {token}", "Mcp-Session-Id": session},
+        )
+    assert "is unavailable" in resp.json()["error"]["message"]
+    assert _outcomes(tmp_path) == ["degraded"]  # from initialize; the call itself none
+
+
 def test_delete_cascades_teardown(aggregate_client, make_token, mock_upstreams):
     pg, gh = mock_upstreams
     token = make_token(groups=[ANALYST_GROUP])

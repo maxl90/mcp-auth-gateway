@@ -2,8 +2,9 @@
 
 The caller's token is validated here and never forwarded. A ``tools/call`` is
 also checked against tool-level RBAC and the step-up requirements, and every
-decision is written to the audit log. :func:`enforce` returns either a
-short-circuit response or the admitted caller.
+decision is written to the audit log: a refusal here, an allowed call by the
+route that forwards it. :func:`enforce` returns either a short-circuit response
+or the admitted caller.
 """
 
 from __future__ import annotations
@@ -283,8 +284,8 @@ def _authorize_calls(calls: list[_ToolCall], caller: _Caller, policy: Policy) ->
     """RBAC, then step-up, over every call in the request.
 
     A denial outranks a step-up challenge, and the first failing call is the one
-    recorded: a refused batch yields exactly one record, a forwarded one yields an
-    ``allowed`` record per call.
+    recorded: a refused batch yields exactly one record. Calls that pass are recorded
+    as ``allowed`` by the route when it forwards them (:meth:`Admitted.record_allowed`).
     """
     groups = _groups(caller.claims)
     for call in calls:
@@ -299,22 +300,31 @@ def _authorize_calls(calls: list[_ToolCall], caller: _Caller, policy: Policy) ->
         if not result.satisfied:
             caller.record("step_up_required", call, f"step-up not satisfied: {result.reason}")
             return _step_up_challenge(call.request_id, requirement, caller.correlation_id)
-    for call in calls:
-        caller.record("allowed", call)
     return None
 
 
 @dataclass(frozen=True)
 class Admitted:
-    """A caller enforcement let through: their claims, and the policy that admitted
-    them, which also decides what a ``tools/list`` shows them."""
+    """A caller enforcement let through: their claims, the policy that admitted them
+    (which also decides what a ``tools/list`` shows them), and the ``tools/call``
+    entries it authorized, with what to record them by."""
 
     claims: Claims
     policy: Policy
+    calls: tuple[_ToolCall, ...] = ()
+    recorder: _Caller | None = None
 
     def allowed_tools(self) -> set[str]:
         """The wire tool names the caller may invoke, from the token's groups."""
         return self.policy.allowed_tools(_groups(self.claims))
+
+    def record_allowed(self) -> None:
+        """Write an ``allowed`` record per authorized call. The route calls this as it
+        forwards the request, because ``allowed`` attests a forwarded call: one the
+        gateway refuses after enforcement, on an expired session say, is not one."""
+        if self.recorder is not None:
+            for call in self.calls:
+                self.recorder.record("allowed", call)
 
 
 async def enforce(
@@ -347,15 +357,16 @@ async def enforce(
     if isinstance(bound, Response):
         return bound, None
 
-    admitted = Admitted(claims, auth.policy)
     calls = _tool_calls(body)
     if not calls:
         # Authenticated pass-through (initialize, tools/list, ping...). The caller is
         # returned so a tools/list response can be filtered by group.
-        return None, admitted
+        return None, Admitted(claims, auth.policy)
 
     caller = _Caller(
         gateway, claims, _channel(request, bound), correlation_id, policy_key, upstream_for
     )
     guard = _authorize_calls(calls, caller, auth.policy)
-    return guard, (None if guard is not None else admitted)
+    if guard is not None:
+        return guard, None
+    return None, Admitted(claims, auth.policy, tuple(calls), caller)

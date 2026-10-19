@@ -52,11 +52,16 @@ logger = logging.getLogger("mcp_auth_gateway")
 
 @dataclass(frozen=True)
 class _Call:
-    """One authenticated request to the virtual server."""
+    """One authenticated request to the virtual server. ``admitted`` is ``None`` only
+    when auth is disabled."""
 
     request: Request
-    claims: Claims | None
+    admitted: enforce.Admitted | None
     correlation_id: str
+
+    @property
+    def claims(self) -> Claims | None:
+        return self.admitted.claims if self.admitted else None
 
     @property
     def gateway(self) -> state.Gateway:
@@ -337,6 +342,10 @@ async def _tools_call(call: _Call, message: dict[str, Any], session: ClientSessi
             headers={"X-Correlation-Id": call.correlation_id},
         )
 
+    # Only now does the call go to an upstream, which is what an `allowed` record
+    # attests: the refusals above and an expired session never get this far.
+    if call.admitted is not None:
+        call.admitted.record_allowed()
     try:
         response = await _call_with_reconnect(
             call, session, route, request_id, params.get("arguments")
@@ -366,17 +375,13 @@ def _parse_message(body: bytes) -> dict[str, Any] | JSONResponse:
 
 
 async def handle_post(
-    request: Request,
-    body: bytes,
-    claims: Claims | None,
-    correlation_id: str,
-    allowed: set[str] | None,
+    request: Request, body: bytes, admitted: enforce.Admitted | None, correlation_id: str
 ) -> Response:
     """Dispatch one authenticated JSON-RPC message to the virtual server."""
     message = _parse_message(body)
     if isinstance(message, Response):
         return message
-    call = _Call(request, claims, correlation_id)
+    call = _Call(request, admitted, correlation_id)
     method = message.get("method")
 
     if method == "initialize":
@@ -391,11 +396,13 @@ async def handle_post(
     # Streamable HTTP client its session is gone — it re-initializes. A session
     # whose owner doesn't match the caller resolves to None here too, so a
     # leaked session id can't be driven by another user.
-    session = _session_from(request, claims)
+    session = _session_from(request, call.claims)
     if session is None:
         return _rpc_error(message.get("id"), -32000, "no valid session", status=404)
 
     if method == "tools/list":
+        # Auth disabled (plumbing checks): serve the catalog unfiltered.
+        allowed = admitted.allowed_tools() if admitted else None
         return await _tools_list(call, message, session, allowed)
     if method == "tools/call":
         return await _tools_call(call, message, session)
@@ -451,13 +458,9 @@ async def handle_mcp(request: Request) -> Response:
     )
     if guard is not None:
         return guard
-    claims = admitted.claims if admitted else None
 
     if request.method == "DELETE":
-        return await handle_delete(request, claims)
+        return await handle_delete(request, admitted.claims if admitted else None)
     if request.method != "POST":
         return Response(status_code=405, headers={"Allow": "POST, DELETE"})
-
-    # Auth disabled (plumbing checks): serve the catalog unfiltered.
-    allowed = admitted.allowed_tools() if admitted else None
-    return await handle_post(request, body, claims, correlation_id, allowed)
+    return await handle_post(request, body, admitted, correlation_id)

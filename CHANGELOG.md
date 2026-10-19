@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-19
+
+An audit fix: an `allowed` record now means the call was forwarded.
+
+### Fixed
+
+- **An `allowed` record could stand for a call that was never forwarded.** The
+  schema defines `allowed` as a forwarded call, but the record was written at the
+  policy decision. In aggregation mode a call the gateway then refused anyway (on
+  an expired or evicted session, in a batch, to an upstream down since
+  `initialize`, or naming an unknown tool) still left one, so after a restart each
+  client's first call was recorded twice. `allowed` is now written as the call is
+  forwarded; denials and step-up challenges are still recorded where they are
+  decided. Python API: `enforce.Admitted.record_allowed()` writes them, and
+  `aggregator.handler.handle_post` takes the admitted caller.
+
 ## [0.3.0] - 2026-10-19
 
 The second review pass and the quality work after it. More of the caller's

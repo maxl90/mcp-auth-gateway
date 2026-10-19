@@ -236,6 +236,8 @@ async def single_upstream(request: Request, target: str) -> Response:
     guard, admitted = await enforce.enforce(request, body, correlation_id)
     if guard is not None:
         return guard
+    if admitted is not None:
+        admitted.record_allowed()  # nothing below refuses the call: it is forwarded
     if admitted is not None and is_tools_list_request(body):
         return await _forward_filtered(
             request,
@@ -274,6 +276,8 @@ async def path_routed(request: Request, subpath: str) -> Response:
     )
     if guard is not None:
         return guard
+    if admitted is not None:
+        admitted.record_allowed()  # nothing below refuses the call: it is forwarded
     if admitted is not None and is_tools_list_request(body):
         # The upstream answers with its own (un-namespaced) tool names; project
         # the caller's namespaced allow-set down to this upstream's slice.
