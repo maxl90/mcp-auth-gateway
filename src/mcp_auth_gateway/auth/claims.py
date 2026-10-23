@@ -38,3 +38,10 @@ class Claims(TypedDict, total=False):
     acrs: list[str] | str
     auth_time: int
     cnf: Confirmation
+
+
+def principal(claims: Claims | None) -> str | None:
+    """Who the caller is: the human's ``oid``, else ``sub``, else the app's ``azp``."""
+    if not claims:
+        return None
+    return claims.get("oid") or claims.get("sub") or claims.get("azp")

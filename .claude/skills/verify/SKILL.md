@@ -69,6 +69,14 @@ baseline file, and the CLIs:
 - The upstream client requires `initialize` to return a JSON-RPC message with
   an `id` and accepts 202-no-body for notifications; content-type must be
   `application/json` (or SSE).
+- Git Bash rewrites container paths in `docker exec` arguments
+  (`/data/x` becomes `C:/Program Files/Git/data/x`); prefix `MSYS_NO_PATHCONV=1`.
+- After a gateway restart a client's next call on its old `Mcp-Session-Id` is a
+  404; it re-initializes and retries. Count the audit records across that: the
+  bounced call must leave none, the retry exactly one `allowed`.
+- Two harness knobs worth having in the state file: a delay on `/keys` (a slow
+  JWKS fetch must not stall `/healthz`) and extra response headers on `tools/call`
+  (for `Connection`-named header stripping).
 
 ## Flows worth driving
 
@@ -80,3 +88,11 @@ baseline file, and the CLIs:
 - Non-conformant `tools/call` args (invented field, wrong type) → forwarded
   (log-never-reject) with `arguments.conformance` populated; grep the audit
   log for the argument values to confirm zero leakage.
+- A cold JWKS cache behind a slow `/keys`: the token request waits, `/healthz`
+  answers in milliseconds meanwhile.
+- An unbound token under `Authorization: DPoP` → 401 `invalid_token`, nothing
+  upstream; the same token under `Bearer` → 200.
+- `Connection: x-foo` with `X-Foo` on the request: `x-foo` never reaches the
+  upstream; the same for a header the upstream names in its own `Connection`.
+- Restart mid-session: the old session's call is a 404 with no audit record, the
+  retry one `allowed`, and the chain links across the restart.

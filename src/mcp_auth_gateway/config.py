@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     gateway_resource_url: str = ""
     # External base URL for 401 resource_metadata pointers behind a proxy; empty = request origin.
     gateway_external_base_url: str = ""
+    # Browser origins accepted on the MCP routes besides the external base URL (JSON list).
+    allowed_origins: list[str] = []
     # Scopes advertised in the PRM document (JSON list in the environment).
     scopes_supported: list[str] = ["access_as_user"]
     # Authorization-server issuer for PRM authorization_servers; empty = gateway_issuer.

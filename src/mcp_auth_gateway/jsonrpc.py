@@ -9,6 +9,7 @@ payloads without disturbing the frames around them.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +18,56 @@ from typing import Any
 COMPACT = (",", ":")
 
 _DATA_PREFIX = "data:"
+
+# The members of a JSON-RPC message, and the tools/call params the gateway authorizes
+# on. A key equal to one of these only when case is ignored is refused: an upstream
+# that matches keys case-insensitively would read a different message.
+_MESSAGE_MEMBERS = frozenset({"jsonrpc", "id", "method", "params", "result", "error"})
+_CALL_PARAMS = frozenset({"name", "arguments"})
+
+
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    if len({key for key, _ in pairs}) != len(pairs):
+        raise ValueError("duplicate key")
+    return dict(pairs)
+
+
+def _no_constant(name: str) -> float:
+    raise ValueError(f"{name} is not JSON")
+
+
+def _finite(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("number out of range")
+    return value
+
+
+def _exact_members(obj: object, members: frozenset[str]) -> None:
+    if isinstance(obj, dict):
+        for key in obj:
+            if key not in members and key.casefold() in members:
+                raise ValueError(f"{key!r} differs from a JSON-RPC member only in case")
+
+
+def canonical_request(body: bytes) -> bytes:
+    """``body`` re-serialized from what the gateway parsed, so the upstream reads the
+    message enforcement checked.
+
+    Raises ``ValueError`` for a body another parser could read differently: not UTF-8
+    JSON, a duplicate key, NaN or an out-of-range number, a lone surrogate, or a
+    JSON-RPC member or tools/call param name in another case."""
+    doc = json.loads(
+        body.decode("utf-8"),
+        object_pairs_hook=_unique_keys,
+        parse_constant=_no_constant,
+        parse_float=_finite,
+    )
+    for message in doc if isinstance(doc, list) else [doc]:
+        _exact_members(message, _MESSAGE_MEMBERS)
+        _exact_members(params_of(message), _CALL_PARAMS)
+    # A lone surrogate fails the encode (UnicodeEncodeError is a ValueError).
+    return json.dumps(doc, separators=COMPACT, ensure_ascii=False).encode("utf-8")
 
 
 @dataclass(frozen=True)

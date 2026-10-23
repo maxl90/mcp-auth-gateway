@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse
 from .. import __version__, jsonrpc, state
 from ..audit import writer as audit
 from ..auth import enforce
-from ..auth.claims import Claims
+from ..auth.claims import Claims, principal
 from ..http_util import read_request_body
 from ..naming import namespace_tool, split_namespaced
 from ..upstreams import Upstream
@@ -34,6 +34,11 @@ from .registry import ClientSession, RouteEntry
 from .upstream_client import UpstreamRequest
 
 _SUPPORTED_PROTOCOL_VERSIONS = {"2025-03-26", "2025-06-18", "2025-11-25"}
+
+# MCP 2026-07-28 drops initialize: every request names its version in params._meta.
+_META_VERSION = "io.modelcontextprotocol/protocolVersion"
+_META_CLIENT = "io.modelcontextprotocol/clientInfo"
+_MAX_LOGGED = 80
 
 _SERVER_INFO = {"name": "mcp-auth-gateway", "version": __version__}
 
@@ -86,13 +91,6 @@ def _rpc_error(
     )
 
 
-def _principal(claims: Claims | None) -> str | None:
-    """Who a session belongs to: the human's ``oid``, else ``sub``, else the app's ``azp``."""
-    if not claims:
-        return None
-    return claims.get("oid") or claims.get("sub") or claims.get("azp")
-
-
 def _session_from(request: Request, claims: Claims | None) -> ClientSession | None:
     """Resolve the caller's session from ``Mcp-Session-Id`` — but only if it
     belongs to them.
@@ -109,7 +107,7 @@ def _session_from(request: Request, claims: Claims | None) -> ClientSession | No
     session = state.of(request).sessions.get(session_id)
     if session is None:
         return None
-    if session.principal != _principal(claims):
+    if session.principal != principal(claims):
         return None
     return session
 
@@ -150,7 +148,7 @@ async def _initialize(call: _Call, message: dict[str, Any]) -> Response:
     upstream now, so the first ``tools/list`` is complete."""
     upstreams = list(call.gateway.upstreams.values())
     registry = call.gateway.sessions
-    session = registry.create(_principal(call.claims))
+    session = registry.create(principal(call.claims))
     for stale in registry.pop_evicted():  # over the per-principal cap, or idle too long
         await _teardown(call.gateway, stale)
 
@@ -358,6 +356,39 @@ async def _tools_call(call: _Call, message: dict[str, Any], session: ClientSessi
 # --- dispatch ---------------------------------------------------------------------
 
 
+def _logged(value: Any) -> str:
+    """A client-supplied value for a log line: repr'd, so it cannot forge lines, and short."""
+    return "-" if value is None else repr(value)[:_MAX_LOGGED]
+
+
+def _log_modern_request(call: _Call, message: dict[str, Any]) -> None:
+    """Log a request in the 2026-07-28 protocol, which the aggregator does not speak.
+
+    The answer is unchanged: ``server/discover`` still gets the 404 below, and that
+    unrecognized error is what makes a dual-era client fall back to ``initialize``.
+    The line says which clients already ask for the modern protocol, and when one
+    that cannot fall back first appears."""
+    params = message.get("params")
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    meta = meta if isinstance(meta, dict) else {}
+    method = message.get("method")
+    if method != "server/discover" and _META_VERSION not in meta:
+        return
+    client = meta.get(_META_CLIENT)
+    client = client if isinstance(client, dict) else {}
+    claims = call.claims or {}
+    logger.warning(
+        "modern protocol request answered as legacy: method=%s version=%s client=%s/%s "
+        "agent=%s correlation_id=%s",
+        _logged(method),
+        _logged(meta.get(_META_VERSION) or call.request.headers.get("mcp-protocol-version")),
+        _logged(client.get("name")),
+        _logged(client.get("version")),
+        _logged(claims.get("azp") or claims.get("appid")),
+        call.correlation_id,
+    )
+
+
 def _parse_message(body: bytes) -> dict[str, Any] | JSONResponse:
     """The one JSON-RPC request in the body, or the error response for anything else."""
     try:
@@ -383,6 +414,7 @@ async def handle_post(
         return message
     call = _Call(request, admitted, correlation_id)
     method = message.get("method")
+    _log_modern_request(call, message)
 
     if method == "initialize":
         return await _initialize(call, message)

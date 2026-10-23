@@ -107,7 +107,8 @@ field name in upper case.
 | `JWKS_CACHE_LIFESPAN` | `300` | Seconds the fetched key set is cached. |
 | `JWKS_REFRESH_MIN_INTERVAL` | `60` | A key-resolution miss forces one refresh and retry, but no more often than this, so bogus `kid` floods cannot become a JWKS fetch storm. |
 | `GATEWAY_RESOURCE_URL` | empty | Canonical resource identifier in Protected Resource Metadata (Entra: `api://<client-id>`). Required when auth is on; the gateway refuses to start without it. |
-| `GATEWAY_EXTERNAL_BASE_URL` | empty | Public `scheme://host[:port]` for the `resource_metadata` pointer behind a reverse proxy, also accepted as a DPoP `htu` base. Empty derives it from the request. |
+| `GATEWAY_EXTERNAL_BASE_URL` | empty | Public `scheme://host[:port]` for the `resource_metadata` pointer behind a reverse proxy, also accepted as a DPoP `htu` base and as a browser `Origin`. Empty derives the pointer from the request. |
+| `ALLOWED_ORIGINS` | `[]` | Browser origins accepted on `/mcp` and `/mcp/<name>` besides `GATEWAY_EXTERNAL_BASE_URL` (a JSON list in the environment). A request with any other `Origin`, `null` included, is a 403 before authentication; one without `Origin` (every non-browser client) is unaffected. The request's own `Host` never counts, so DNS rebinding cannot pass. |
 | `SCOPES_SUPPORTED` | `["access_as_user"]` | Scopes advertised in the PRM document (a JSON list in the environment). |
 | `ENTRA_AUTH_SERVER_METADATA_URL` | empty | Issuer identifier published in PRM `authorization_servers`; empty falls back to `GATEWAY_ISSUER`. |
 | `POLICY_PATH` | `policy.generated.yaml` | Group-id to allowed-tools map; `examples/policy.example.yaml` documents the shape. |
@@ -148,7 +149,10 @@ See `examples/upstreams.example.yaml` and `examples/policy.aggregate.example.yam
 ## Evidence
 
 Every governed call is logged as an attributed, hash-chained record. The schema
-is locked at 1.2; 1.x changes are additive, so SIEM queries keep working.
+is locked at 1.2; 1.x changes are additive, so SIEM queries keep working. A
+refused call is recorded where it is refused (`denied`, `step_up_required`), and
+an `allowed` record is written as the call is forwarded, so a call the gateway
+turns away for another reason, such as an expired session, leaves none.
 
 ```sh
 # Verify the audit trail hasn't been tampered with (walks the hash chain):

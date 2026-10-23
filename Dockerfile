@@ -1,19 +1,26 @@
 # The gateway image. The demo upstreams have their own Dockerfiles under deploy/upstreams/.
 #
-# The base image is pinned by digest (the manifest-list digest for
-# python:3.12-slim), so the OS layer does not move under a rebuild. The Python
-# dependencies are not pinned: pip resolves the ranges in pyproject.toml at build
-# time and does not read uv.lock.
-# To update the digest: docker buildx imagetools inspect python:3.12-slim
+# Both base images are pinned by digest (the manifest-list digest), so neither
+# moves under a rebuild, and the runtime dependencies are the ones uv.lock pins,
+# the versions CI tests. To update a digest: docker buildx imagetools inspect <image>
+
+# The lock's runtime dependencies as a hashed requirements file.
+FROM ghcr.io/astral-sh/uv:0.10.7@sha256:edd1fd89f3e5b005814cc8f777610445d7b7e3ed05361f9ddfae67bebfe8456a AS lock
+COPY pyproject.toml uv.lock /src/
+RUN ["/uv", "export", "--project", "/src", "--frozen", "--no-dev", "--no-emit-project", "--format", "requirements-txt", "--output-file", "/requirements.txt"]
+
 FROM python:3.12-slim@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203
 
 WORKDIR /app
 
-# Install just the package + its runtime deps. README/LICENSE are referenced by
-# pyproject metadata, so copy them before the install.
+# --require-hashes refuses anything the file does not pin, so pip cannot pull in a
+# version the lock does not name; the package itself then adds no dependencies.
+# README/LICENSE are referenced by pyproject metadata, so copy them before the install.
+COPY --from=lock /requirements.txt ./
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt \
+    && pip install --no-cache-dir --no-deps .
 
 # Run as a dedicated non-root user. /app stays writable because the gateway
 # writes its local sinks (audit.log, manifest-baseline.json) to the workdir by

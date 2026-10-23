@@ -19,7 +19,7 @@ import uvicorn
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import proxy
+from . import origin, proxy
 from .aggregator import handler as aggregator
 from .audit.manifest import ManifestBaseline
 from .audit.writer import AuditLog
@@ -55,6 +55,8 @@ async def protected_resource_metadata() -> Response:
 
 @router.api_route("/mcp", methods=_PROXY_METHODS)
 async def proxy_mcp(request: Request) -> Response:
+    if refused := origin.refuse(request):
+        return refused
     if aggregation_enabled():
         return await aggregator.handle_mcp(request)
     return await proxy.single_upstream(request, settings.upstream_mcp_url)
@@ -62,6 +64,8 @@ async def proxy_mcp(request: Request) -> Response:
 
 @router.api_route("/mcp/{subpath:path}", methods=_PROXY_METHODS)
 async def proxy_mcp_subpath(request: Request, subpath: str) -> Response:
+    if refused := origin.refuse(request):
+        return refused
     if not proxy.is_safe_subpath(subpath):
         return JSONResponse(
             {"error": "invalid_path", "detail": "path segments allow only A-Z a-z 0-9 - . _ ~"},

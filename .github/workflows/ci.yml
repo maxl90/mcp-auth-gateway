@@ -60,5 +60,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
       - name: Build the gateway image
-        run: docker build .
+        run: docker build -t gateway-ci .
+      # The image must run the dependency versions the tests ran: every package the
+      # lock pins for linux installed at that version, and nothing the lock lacks.
+      - name: Image installs exactly the lock
+        run: |
+          uv export --frozen --no-dev --no-emit-project --format requirements-txt -o lock.txt
+          docker run --rm -v "$PWD/lock.txt:/tmp/lock.txt:ro" --entrypoint sh gateway-ci -ec '
+            pip install --dry-run --no-index --no-deps --require-hashes --quiet -r /tmp/lock.txt
+            pip check
+            extra=$(pip list --format=freeze --exclude pip --exclude mcp-auth-gateway \
+              | cut -d= -f1 | tr "A-Z_." "a-z--" \
+              | while read -r n; do grep -q "^$n==" /tmp/lock.txt || echo "$n"; done)
+            test -z "$extra" || { echo "installed but not in uv.lock: $extra"; exit 1; }'

@@ -13,6 +13,11 @@ expectation — never from ``err.instance`` or ``err.message``, both of which
 embed the offending value. Property *names* (the JSON path, unexpected keys)
 are shape, not data, matching the ``arg_keys`` precedent. Asserted
 adversarially in the tests.
+
+**No network.** The schema comes from the upstream, so a ``$ref`` is resolved
+only inside the schema itself: one that points anywhere else (a network URI) is
+never fetched and makes the verdict a ``schema_error``, as MCP 2026-07-28
+requires. Schema size is capped for the same reason: the upstream controls it.
 """
 
 from __future__ import annotations
@@ -20,11 +25,30 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from jsonschema import ValidationError, validators
+from jsonschema import Draft202012Validator, ValidationError, validators
+from referencing import Registry
 
 _MAX_VIOLATIONS = 10
 _MAX_EXPECTED_LEN = 120
 _MAX_UNEXPECTED_KEYS = 20
+_MAX_SCHEMA_NODES = 2000
+_MAX_SCHEMA_DEPTH = 32
+
+
+def _within_limits(schema: dict[str, Any]) -> bool:
+    """Whether the schema's object count and nesting depth are inside the caps."""
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(schema, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            nodes += 1
+            if nodes > _MAX_SCHEMA_NODES or depth > _MAX_SCHEMA_DEPTH:
+                return False
+            stack.extend((value, depth + 1) for value in node.values())
+        elif isinstance(node, list):
+            stack.extend((value, depth) for value in node)
+    return True
 
 
 def _expected(validator_value: Any) -> str:
@@ -55,16 +79,21 @@ def _describe(err: ValidationError) -> dict[str, Any]:
 def check(schema: dict[str, Any] | None, arguments: Any) -> dict[str, Any] | None:
     """The ``conformance`` block for a tool-call record, or ``None`` with no pinned schema.
 
-    An invalid or unsupported schema yields ``{"schema_error": true}``; otherwise
+    An invalid, unsupported or oversize schema, or one with a ``$ref`` that does
+    not resolve inside it, yields ``{"schema_error": true}``; otherwise
     ``schema_conformant`` plus value-free ``violations`` when false. Absent
     arguments validate as ``{}``: a tool that requires arguments got none.
     """
     if not isinstance(schema, dict):
         return None
+    if not _within_limits(schema):
+        return {"schema_conformant": None, "schema_error": True}
     try:
-        validator_cls = validators.validator_for(schema)
+        validator_cls = validators.validator_for(schema, default=Draft202012Validator)
         validator_cls.check_schema(schema)
-        validator = validator_cls(schema)
+        # An empty registry has no retrieval: refs into the schema still resolve,
+        # anything else raises instead of being fetched.
+        validator = validator_cls(schema, registry=Registry())
         errors = sorted(
             validator.iter_errors(arguments if arguments is not None else {}),
             key=lambda e: str(e.json_path),

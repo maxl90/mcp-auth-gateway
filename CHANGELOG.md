@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-23
+
+Security fixes: four from the third-pass review, and two MCP spec requirements the
+gateway did not meet (never fetch a remote `$ref`; validate `Origin`). Also a log
+line for requests in the newer MCP protocol.
+
+### Added
+
+- **A log line for each request in the MCP 2026-07-28 protocol.** The aggregator
+  does not speak it yet. A dual-era client's `server/discover` probe gets the same
+  404 as before, which is what makes it fall back to `initialize`, and the gateway
+  now logs a warning naming the method, the requested version, the client's
+  self-reported name and version, and the calling app, with the correlation id.
+  The log shows which clients already ask for the new protocol, and when one that
+  cannot fall back first appears. Values the client sent are quoted and truncated.
+
+### Security
+
+- **The forwarding routes could forward a call enforcement never saw.** On `/mcp`
+  in single-upstream mode and on the path-routed `/mcp/<name>`, a body the gateway
+  could not parse was admitted as carrying no `tools/call` and forwarded byte for
+  byte, with no RBAC check, step-up or audit record. A body two parsers read
+  differently went the same way: with a duplicate `name`, the gateway checked one
+  tool and a first-wins upstream ran another. These routes now refuse a
+  content-encoded body (415) and one that is not unambiguous UTF-8 JSON (400: a
+  duplicate key, a JSON-RPC member or `tools/call` param name in another case, NaN,
+  an out-of-range number, a lone surrogate), and forward the gateway's own
+  serialization of the body it checked. An unauthenticated caller still gets the 401
+  first. Aggregated `/mcp` was not affected: it builds every upstream request itself.
+- **One caller could take the upstream connection pool from everyone.** The
+  forwarding routes share one pooled client (100 connections) with the aggregator,
+  and a forwarded response stays open as long as the upstream keeps it open, so a
+  signed-in user holding about 100 open responses made every other caller's
+  upstream requests on that gateway time out. Each principal now has at most 16
+  requests in flight on those routes; past that the gateway answers 429 with
+  `Retry-After` and forwards nothing. A forwarded response also closes its upstream
+  connection when the client was gone before it started; it used to stay open.
+- **The image did not run the dependency versions CI tested.** The Dockerfile ran
+  `pip install .`, which resolves the ranges in `pyproject.toml` at build time, and
+  `.dockerignore` left `uv.lock` out of the build context. The 0.3.1 image held 20
+  versions the lock does not pin (FastAPI 0.149.0 for 0.137.2, Starlette 1.9.0 for
+  1.3.1) and one package it does not name. The image now installs the lock's
+  runtime dependencies from a hashed export (`pip --require-hashes`) and the
+  package with `--no-deps`, from a uv stage pinned by digest, and CI fails when the
+  built image holds anything other than what the lock pins.
+- **The demo stack published its Postgres MCP upstream on every interface.**
+  `docker-compose.yml` mapped `9000:9000` for an upstream that runs with
+  `--access-mode=unrestricted` and no authentication, so anyone on the network
+  could query the demo database without passing the gateway. It is now bound to
+  `127.0.0.1`, like the GitHub upstream and the demo database, and a test fails if
+  any compose file publishes a service other than the gateway or the edge proxy
+  beyond loopback.
+- **A tool schema could make the gateway send requests to any host.** The
+  schema-conformance check validated call arguments against the upstream's pinned
+  `inputSchema`, and the validator fetched any `$ref` to a network URI, on every
+  call to that tool. An upstream that controls its schemas could point the gateway
+  at internal services or cloud metadata from inside the network (blind: the
+  response only fed telemetry, and no token or argument value was sent). The fetch
+  had no timeout and ran on the event loop. A `$ref` now resolves only inside the
+  schema; anything else is never fetched and the record's `conformance` is
+  `schema_error`, as MCP 2026-07-28 requires. Schemas over 2,000 objects or nested
+  deeper than 32 are a `schema_error` too.
+- **The MCP routes did not check `Origin`.** The transport has required it since
+  2025-03-26: a web page can make a browser send requests to a gateway it can reach,
+  including one on loopback (DNS rebinding). `/mcp` and `/mcp/<name>` now answer 403
+  with a JSON-RPC error and no `id`, before authentication and without an audit
+  record, to any `Origin` other than `GATEWAY_EXTERNAL_BASE_URL` or one listed in the
+  new `ALLOWED_ORIGINS`; `null` and malformed values are refused, and the refused
+  origin is logged. Requests without `Origin` (every non-browser client) are
+  unaffected. The request's own `Host` is never accepted as an origin, since a
+  rebinding page controls it. **Deploying:** a browser-based client must be listed in
+  `ALLOWED_ORIGINS` or served from the external base URL.
+
 ## [0.3.1] - 2026-10-19
 
 An audit fix: an `allowed` record now means the call was forwarded.

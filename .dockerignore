@@ -8,4 +8,3 @@ __pycache__/
 .env.generated
 policy.generated.yaml
 infra/entra-output.json
-uv.lock

@@ -51,7 +51,9 @@ services:
     environment:
       DATABASE_URI: postgresql://demo:demo@db:5432/clinic
     ports:
-      - "9000:9000"
+      # Loopback-only: this is the RAW upstream (no auth) — publishing it beyond
+      # localhost would let LAN callers bypass the gateway entirely.
+      - "127.0.0.1:9000:9000"
     depends_on:
       db:
         condition: service_healthy

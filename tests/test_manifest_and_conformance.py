@@ -6,7 +6,9 @@ appear in an audit record), asserted adversarially below.
 
 from __future__ import annotations
 
+import http.server
 import json
+import threading
 
 import httpx
 import pytest
@@ -181,6 +183,67 @@ def test_violations_are_capped():
     result = conformance.check(schema, args)
     assert len(result["violations"]) == 10
     assert result["violations_truncated"] == 15
+
+
+@pytest.fixture
+def listener():
+    """A local HTTP server that records every request path it receives."""
+    hits: list[str] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            body = b'{"type": "object"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}", hits
+    server.shutdown()
+    server.server_close()
+
+
+def test_remote_ref_is_never_fetched(listener):
+    """A pinned schema can come from an upstream that controls it: a `$ref` to a
+    network URI must not make the gateway send a request (blind SSRF)."""
+    base, hits = listener
+    schemas = [
+        {"type": "object", "properties": {"q": {"$ref": f"{base}/internal-only"}}},
+        {"$id": f"{base}/root.json", "$ref": "other.json"},  # relative to a remote $id
+    ]
+    for schema in schemas:
+        result = conformance.check(schema, {"q": "x"})
+        assert result == {"schema_conformant": None, "schema_error": True}
+    assert hits == []
+
+
+def test_local_defs_refs_still_resolve():
+    schema = {
+        "type": "object",
+        "properties": {"n": {"$ref": "#/$defs/count"}},
+        "$defs": {"count": {"type": "integer"}},
+    }
+    assert conformance.check(schema, {"n": 3}) == {"schema_conformant": True}
+    result = conformance.check(schema, {"n": "three"})
+    assert result["schema_conformant"] is False
+    assert result["violations"][0]["keyword"] == "type"
+
+
+def test_oversize_schemas_degrade_to_schema_error():
+    wide = {"type": "object", "properties": {f"p{i}": {"type": "string"} for i in range(2001)}}
+    deep: dict = {"type": "string"}
+    for _ in range(40):
+        deep = {"type": "array", "items": deep}
+    for schema in (wide, deep):
+        assert conformance.check(schema, []) == {"schema_conformant": None, "schema_error": True}
 
 
 # --- catalog extraction (observation hook input) -----------------------------
