@@ -21,8 +21,11 @@ from pathlib import Path
 from typing import Any, Literal, NotRequired, TypedDict
 
 from ..auth.claims import Claims
+from .structure import clip
 
 logger = logging.getLogger("mcp_auth_gateway.audit")
+
+_MAX_REASON_LEN = 1024
 
 # Bump only on a breaking field change; additive fields keep 1.x.
 # 1.1 added `manifest` (tool-definition hash pinning + drift) and
@@ -169,10 +172,12 @@ def build_record(event: AuditEvent) -> RecordContent:
         # Transport-layer identity (v1.2): edge mTLS cert serial/DN + DPoP key
         # thumbprint, when present. None on records with no channel evidence.
         "channel": event.channel,
-        "tool": event.tool,
+        # Clipped: a refused call's tool name is whatever the caller sent, and a
+        # degraded record's reason quotes the upstream's error.
+        "tool": clip(event.tool) if event.tool is not None else None,
         "upstream": event.upstream,
         "outcome": event.outcome,
-        "reason": event.reason,
+        "reason": clip(event.reason, _MAX_REASON_LEN) if event.reason is not None else None,
         # Pinned tool-definition hash: {"sha256"} on tool calls (what the agent
         # saw); + {"previous_sha256"} on manifest_drift records. None elsewhere.
         "manifest": event.manifest,

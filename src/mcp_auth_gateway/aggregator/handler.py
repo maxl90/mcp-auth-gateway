@@ -22,7 +22,7 @@ import httpx
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
-from .. import __version__, jsonrpc, state
+from .. import __version__, jsonrpc, proxy, state
 from ..audit import writer as audit
 from ..auth import enforce
 from ..auth.claims import Claims, principal
@@ -495,4 +495,12 @@ async def handle_mcp(request: Request) -> Response:
         return await handle_delete(request, admitted.claims if admitted else None)
     if request.method != "POST":
         return Response(status_code=405, headers={"Allow": "POST, DELETE"})
-    return await handle_post(request, body, admitted, correlation_id)
+    # The aggregator buffers each upstream answer, for up to the call timeout, on the
+    # pool the forwarding routes share: the same per-caller cap covers both.
+    release = proxy.take_slot(request, admitted)
+    if isinstance(release, Response):
+        return release
+    try:
+        return await handle_post(request, body, admitted, correlation_id)
+    finally:
+        release()

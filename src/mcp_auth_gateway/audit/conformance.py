@@ -28,6 +28,8 @@ from typing import Any
 from jsonschema import Draft202012Validator, ValidationError, validators
 from referencing import Registry
 
+from .structure import clip
+
 _MAX_VIOLATIONS = 10
 _MAX_EXPECTED_LEN = 120
 _MAX_UNEXPECTED_KEYS = 20
@@ -62,7 +64,7 @@ def _expected(validator_value: Any) -> str:
 def _describe(err: ValidationError) -> dict[str, Any]:
     """One value-free violation; never ``err.message``, which interpolates the instance value."""
     violation: dict[str, Any] = {
-        "path": err.json_path,
+        "path": clip(err.json_path),  # built from argument keys, which the caller chooses
         "keyword": err.validator,
         "expected": _expected(err.validator_value),
     }
@@ -72,7 +74,7 @@ def _describe(err: ValidationError) -> dict[str, Any]:
         declared = err.schema.get("properties") if isinstance(err.schema, dict) else None
         declared_keys = set(declared) if isinstance(declared, dict) else set()
         extras = sorted(str(k) for k in err.instance if k not in declared_keys)
-        violation["unexpected_keys"] = extras[:_MAX_UNEXPECTED_KEYS]
+        violation["unexpected_keys"] = [clip(k) for k in extras[:_MAX_UNEXPECTED_KEYS]]
     return violation
 
 

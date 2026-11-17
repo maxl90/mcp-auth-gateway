@@ -127,3 +127,25 @@ def test_dot_segments_cannot_escape_the_named_upstream(aggregate_client, make_to
         )
     assert resp.status_code == 404
     assert pg.call_count == 0 and gh.call_count == 0
+
+
+def test_a_callers_attribution_headers_do_not_reach_the_upstream(aggregate_client, make_token):
+    # Only the aggregator states attribution. On this route a backend that reads the
+    # headers would otherwise record whoever the caller named.
+    token = make_token(groups=[ANALYST_GROUP])
+    with respx.mock:
+        pg = respx.post(PG_URL).mock(
+            return_value=httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
+        )
+        resp = aggregate_client.post(
+            "/mcp/postgres",
+            json=_tools_call("execute_sql"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-MCP-Gateway-On-Behalf-Of": "someone-else",
+                "X-MCP-Gateway-Correlation-Id": "forged",
+            },
+        )
+    assert resp.status_code == 200
+    sent = {k.lower() for k in pg.calls.last.request.headers}
+    assert not any(name.startswith("x-mcp-gateway-") for name in sent)

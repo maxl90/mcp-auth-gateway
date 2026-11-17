@@ -177,6 +177,9 @@ def test_credentials_and_client_forwarding_headers_stay_at_the_gateway(legacy_cl
         "X-Real-IP": "1.2.3.4",
         "X-Client-Cert-Serial": "SPOOF",
         "X-Client-Cert-DN": "CN=spoof",
+        # Attribution is the gateway's to state: a caller's copy would be a forgery.
+        "X-MCP-Gateway-On-Behalf-Of": "someone-else",
+        "X-MCP-Gateway-Correlation-Id": "forged",
     }
     with respx.mock:
         route = respx.post(UPSTREAM).mock(

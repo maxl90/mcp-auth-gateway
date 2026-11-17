@@ -177,12 +177,15 @@ def test_htu_comparison_ignores_query_fragment_case_and_a_trailing_slash():
     assert dpop._normalize_htu("HTTPS://GW.Example/mcp/?x=1#f") == "https://gw.example/mcp"
 
 
-def test_the_public_url_is_accepted_behind_the_edge(monkeypatch):
+def test_only_the_public_url_is_accepted_once_it_is_configured(monkeypatch):
+    # The URL as seen comes from the request's Host, which the sender chooses.
     monkeypatch.setattr(dpop.settings, "gateway_external_base_url", "https://public.example/")
-    assert dpop.expected_htus("http://10.0.0.5:8080/mcp", "/mcp") == {
-        "http://10.0.0.5:8080/mcp",
-        "https://public.example/mcp",
-    }
+    assert dpop.expected_htus("http://10.0.0.5:8080/mcp", "/mcp") == {"https://public.example/mcp"}
+
+
+def test_the_url_as_seen_is_accepted_when_no_public_url_is_configured(monkeypatch):
+    monkeypatch.setattr(dpop.settings, "gateway_external_base_url", "")
+    assert dpop.expected_htus("http://10.0.0.5:8080/mcp", "/mcp") == {"http://10.0.0.5:8080/mcp"}
 
 
 def test_a_full_replay_cache_forgets_expired_entries_first_then_the_oldest():

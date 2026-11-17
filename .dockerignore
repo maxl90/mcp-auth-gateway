@@ -8,3 +8,15 @@ __pycache__/
 .env.generated
 policy.generated.yaml
 infra/entra-output.json
+# Local state and secrets the build never needs, kept out of the build context.
+.env*
+!.env.example
+*.generated.yaml
+.msal_token_cache.bin*
+audit.log
+manifest-baseline.json
+docker-compose.override.yml
+infra/edge/certs/
+.review/
+.mypy_cache/
+.coverage

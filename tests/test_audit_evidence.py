@@ -231,3 +231,34 @@ def test_export_flattens_attribution_and_structure(tmp_path):
     assert row["ArgPiiColumns"] == "mrn"
     assert row["TouchesPii"] is True
     assert row["RecordHash"]  # tamper-evidence carried into the export
+
+
+def test_oversize_sql_is_not_parsed():
+    # Parsing takes seconds per megabyte on the event loop, for a denied call too.
+    sql = "SELECT " + ",".join(f"c{i}" for i in range(20_000)) + " FROM patients"
+    assert len(sql) > 64 * 1024
+    assert structure.describe("execute_sql", {"sql": sql}) == {"kind": "sql", "too_large": True}
+
+
+def test_arg_keys_are_capped_in_number_and_length():
+    arguments = {f"k{i:04d}": i for i in range(150)} | {"z" * 5000: 1}
+    desc = structure.describe("some_tool", arguments)
+    assert len(desc["arg_keys"]) == 100
+    assert desc["arg_keys_truncated"] == 51
+    assert max(len(k) for k in desc["arg_keys"]) <= structure.MAX_NAME_LEN + 1
+
+    long_key = structure.describe("some_tool", {"z" * 5000: 1})
+    assert long_key["arg_keys"] == ["z" * structure.MAX_NAME_LEN + "…"]
+    assert "arg_keys_truncated" not in long_key
+
+
+def test_record_clips_the_tool_name_and_reason():
+    rec = writer.build_record(
+        writer.AuditEvent(outcome="denied", tool="t" * 5000, correlation_id="c", reason="r" * 5000)
+    )
+    assert rec["tool"] == "t" * 256 + "…"
+    assert rec["reason"] == "r" * 1024 + "…"
+    short = writer.build_record(
+        writer.AuditEvent(outcome="denied", tool="list_schemas", correlation_id="c", reason="no")
+    )
+    assert (short["tool"], short["reason"]) == ("list_schemas", "no")

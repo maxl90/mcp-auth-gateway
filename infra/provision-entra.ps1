@@ -36,7 +36,12 @@ $ErrorActionPreference = "Stop"
 function Say($m){ Write-Host "==> $m" -ForegroundColor Cyan }
 function New-Pass {
   $chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#%^*-_".ToCharArray()
-  -join (1..20 | ForEach-Object { $chars | Get-Random })
+  # The system's cryptographic generator, not Get-Random. 64 characters divide a
+  # byte's 256 values evenly, so the modulo has no bias.
+  $bytes = New-Object byte[] 20
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+  -join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] })
 }
 
 # --- 0. Preconditions -------------------------------------------------------

@@ -78,14 +78,16 @@ def _normalize_htu(url: str) -> str:
 
 
 def expected_htus(request_url: str, path: str) -> set[str]:
-    """The acceptable ``htu`` values for this request: the URL as the gateway
-    saw it, plus the same path on ``GATEWAY_EXTERNAL_BASE_URL`` when set —
-    behind the edge proxy the client signs the *public* URL."""
-    accepted = {_normalize_htu(request_url)}
+    """The acceptable ``htu`` values for this request: its path on
+    ``GATEWAY_EXTERNAL_BASE_URL`` when that is set (behind the edge proxy the client
+    signs the *public* URL), otherwise the URL as the gateway saw it.
+
+    The URL as seen is built from the request's ``Host``, which the sender chooses,
+    so it is used only when the gateway has not been told its own address."""
     base = settings.gateway_external_base_url.rstrip("/")
     if base:
-        accepted.add(_normalize_htu(f"{base}{path}"))
-    return accepted
+        return {_normalize_htu(f"{base}{path}")}
+    return {_normalize_htu(request_url)}
 
 
 class ReplayCache:

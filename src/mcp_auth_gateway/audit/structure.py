@@ -50,6 +50,19 @@ _PII_HINTS = frozenset(
 )
 
 
+# The caller chooses the tool name, the argument keys and the SQL, and a record is
+# written for a call that is refused too. These caps bound what one request can add
+# to the log and how long describing it can hold the event loop.
+MAX_NAME_LEN = 256
+_MAX_ARG_KEYS = 100
+_MAX_SQL_LEN = 64 * 1024
+
+
+def clip(text: str, limit: int = MAX_NAME_LEN) -> str:
+    """``text``, cut to ``limit`` characters with a trailing ``…`` when it was longer."""
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def _looks_pii(column: str) -> bool:
     c = column.lower()
     return any(hint in c for hint in _PII_HINTS)
@@ -59,6 +72,9 @@ def _describe_sql(sql: Any) -> dict[str, Any]:
     """Tables, columns, statement types and PII-shaped columns of a SQL string; never the SQL."""
     if not isinstance(sql, str):
         return {"kind": "sql", "sql_present": bool(sql)}
+    if len(sql) > _MAX_SQL_LEN:
+        # Parsing is synchronous and takes seconds per megabyte: not for a caller to spend.
+        return {"kind": "sql", "too_large": True}
     try:
         statements = sqlglot.parse(sql)
     except Exception:  # any parser error degrades, never leaks
@@ -92,8 +108,9 @@ def _describe_sql(sql: Any) -> dict[str, Any]:
 def describe(tool: str, arguments: Any) -> dict[str, Any] | None:
     """Value-free structural metadata for a ``tools/call``, or ``None`` without arguments.
 
-    A SQL-running tool (base name ``execute_sql``) yields table/column/PII shape; any
-    other tool yields its sorted top-level argument keys.
+    A SQL-running tool (base name ``execute_sql``) yields table/column/PII shape, or
+    ``too_large`` for SQL past the parse cap; any other tool yields its sorted
+    top-level argument keys, each clipped, the first ``_MAX_ARG_KEYS`` of them.
     """
     if arguments is None:
         return None
@@ -105,7 +122,14 @@ def describe(tool: str, arguments: Any) -> dict[str, Any] | None:
         return _describe_sql(sql)
 
     if isinstance(arguments, dict):
-        return {"kind": "generic", "arg_keys": sorted(str(k) for k in arguments)}
+        keys = sorted(str(k) for k in arguments)
+        described: dict[str, Any] = {
+            "kind": "generic",
+            "arg_keys": [clip(k) for k in keys[:_MAX_ARG_KEYS]],
+        }
+        if len(keys) > _MAX_ARG_KEYS:
+            described["arg_keys_truncated"] = len(keys) - _MAX_ARG_KEYS
+        return described
 
     # Non-dict arguments (a bare scalar/list): record only the type, never the value.
     return {"kind": "generic", "arg_type": type(arguments).__name__}

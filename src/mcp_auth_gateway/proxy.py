@@ -59,9 +59,11 @@ _SERVER_OWNED = frozenset({"date", "server"})
 # stripping them is the trust boundary in code form, and the upstream MCP server
 # reaches its resource with its own service identity. Cookies and client-chosen
 # forwarding or edge-identity headers stop here too: an upstream that read them
-# would see values the caller picked, arriving from the gateway's address.
+# would see values the caller picked, arriving from the gateway's address. The
+# gateway's own attribution headers (``x-mcp-gateway-*``) are the same: only the
+# aggregator sets them, so one on a forwarded request is the caller's forgery.
 _STRIP_ON_FORWARD = frozenset({"authorization", "dpop", "cookie", "forwarded", "x-real-ip"})
-_STRIP_PREFIXES_ON_FORWARD = ("x-forwarded-", "x-client-cert-")
+_STRIP_PREFIXES_ON_FORWARD = ("x-forwarded-", "x-client-cert-", "x-mcp-gateway-")
 
 
 # RFC 3986 unreserved characters: nothing an upstream could decode or reinterpret.
@@ -184,12 +186,11 @@ async def _enforce(
     return readable, admitted
 
 
-def _take_slot(
-    request: Request, admitted: enforce.Admitted | None
-) -> Callable[[], None] | Response:
-    """One of the caller's forwarding slots (:class:`state.ForwardSlots`): the function
+def take_slot(request: Request, admitted: enforce.Admitted | None) -> Callable[[], None] | Response:
+    """One of the caller's upstream slots (:class:`state.ForwardSlots`): the function
     that frees it once the upstream response is done, or a 429 when all are in use.
-    With auth off there is no principal and no cap."""
+    The aggregator takes one per request as well. With auth off there is no principal
+    and no cap."""
     if admitted is None:
         return lambda: None
     caller = principal(admitted.claims) or ""
@@ -336,7 +337,7 @@ async def single_upstream(request: Request, target: str) -> Response:
     if isinstance(enforced, Response):
         return enforced
     body, admitted = enforced
-    release = _take_slot(request, admitted)
+    release = take_slot(request, admitted)
     if isinstance(release, Response):
         return release
     if admitted is not None:
@@ -381,7 +382,7 @@ async def path_routed(request: Request, subpath: str) -> Response:
     if isinstance(enforced, Response):
         return enforced
     body, admitted = enforced
-    release = _take_slot(request, admitted)
+    release = take_slot(request, admitted)
     if isinstance(release, Response):
         return release
     if admitted is not None:

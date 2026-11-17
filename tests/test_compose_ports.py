@@ -60,3 +60,16 @@ def test_only_the_front_doors_are_published_beyond_loopback(path):
         if _published(port) != "127.0.0.1"
     ]
     assert exposed == []
+
+
+@pytest.mark.parametrize("path", _COMPOSE_FILES, ids=lambda p: p.name)
+def test_a_gateway_with_auth_off_is_published_on_loopback_only(path):
+    # With auth off the gateway is a raw upstream with a different port number.
+    services = (yaml.load(path.read_text(encoding="utf-8"), _ComposeLoader) or {}).get(
+        "services", {}
+    )
+    gateway = services.get("gateway") or {}
+    auth = str((gateway.get("environment") or {}).get("AUTH_ENABLED", "true")).lower()
+    if auth != "false":
+        return
+    assert [p for p in gateway.get("ports") or [] if _published(p) != "127.0.0.1"] == []

@@ -13,7 +13,9 @@ services:
       AUTH_ENABLED: "false"                              # <-- no identity in this mode
       UPSTREAM_MCP_URL: http://mcp-upstream:9000/mcp     # compose-DNS to the upstream
     ports:
-      - "8080:8080"
+      # Loopback-only: with auth off, anyone who can reach this port can run SQL
+      # on the demo database.
+      - "127.0.0.1:8080:8080"
     depends_on:
       - mcp-upstream
 

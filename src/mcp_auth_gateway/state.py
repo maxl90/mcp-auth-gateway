@@ -22,11 +22,12 @@ from .upstreams import Upstream
 
 
 class ForwardSlots:
-    """Upstream requests in flight per principal on the forwarding routes.
+    """Requests in flight per principal, on the forwarding routes and the aggregator.
 
-    Those routes share one connection pool, and a forwarded response stays open as
-    long as the upstream keeps it open, so without a cap one caller could hold every
-    connection. A principal's entry goes when its last request finishes."""
+    They share one connection pool. A forwarded response stays open as long as the
+    upstream keeps it open, and an aggregated call waits for its upstream's answer,
+    so without a cap one caller could hold every connection. A principal's entry
+    goes when its last request finishes."""
 
     def __init__(self, per_principal: int = 16) -> None:
         self.per_principal = per_principal

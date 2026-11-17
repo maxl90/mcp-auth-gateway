@@ -21,6 +21,7 @@ from mcp_auth_gateway.auth.policy_resolver import Policy
 from mcp_auth_gateway.state import ForwardSlots
 
 from .conftest import ANALYST_GROUP, PG_URL, UPSTREAM
+from .fakes import fake_upstream
 
 _POLICY = Policy(groups={ANALYST_GROUP: ["list_schemas", "postgres__list_schemas"]})
 
@@ -135,3 +136,39 @@ def test_an_unreachable_upstream_frees_the_slot(
         first = c.post(path, content=_CALL, headers={"Authorization": f"Bearer {token}"})
         second = c.post(path, content=_CALL, headers={"Authorization": f"Bearer {token}"})
     assert (first.status_code, second.status_code) == (502, 200)
+
+
+def test_the_aggregated_route_takes_a_slot_too(gateway_client, upstreams, make_token):
+    # An aggregated call waits on the shared pool for its upstream's answer, so it
+    # counts against the same per-caller cap, and frees its slot when answered.
+    policy = Policy(groups={ANALYST_GROUP: ["postgres__list_schemas"]})
+    busy = {"Authorization": f"Bearer {make_token(oid='busy-caller', groups=[ANALYST_GROUP])}"}
+    other = {"Authorization": f"Bearer {make_token(oid='other-caller', groups=[ANALYST_GROUP])}"}
+    init = {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}}
+    call = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "postgres__list_schemas"},
+    }
+    with gateway_client("aggregate", policy, upstreams=upstreams[:1]) as c, respx.mock:
+        route = respx.route(url=PG_URL).mock(
+            side_effect=fake_upstream("postgres", ["list_schemas"], "pg-sess")
+        )
+        sessions = {
+            name: c.post("/mcp", json=init, headers=h).headers["mcp-session-id"]
+            for name, h in (("busy", busy), ("other", other))
+        }
+        slots = c.app.state.gateway.forward_slots
+        assert not slots._in_flight  # the two initialize requests freed theirs
+        while slots.acquire("busy-caller"):
+            pass
+        before = route.call_count
+        refused = c.post("/mcp", json=call, headers=busy | {"Mcp-Session-Id": sessions["busy"]})
+        served = c.post("/mcp", json=call, headers=other | {"Mcp-Session-Id": sessions["other"]})
+        audit_log = c.app.state.gateway.audit.path.read_text()
+    assert refused.status_code == 429
+    assert refused.json()["error"] == "too_many_requests"
+    assert served.status_code == 200
+    assert route.call_count == before + 1  # only the other caller's call went upstream
+    assert [json.loads(line)["outcome"] for line in audit_log.splitlines()] == ["allowed"]

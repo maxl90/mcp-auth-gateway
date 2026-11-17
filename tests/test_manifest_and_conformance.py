@@ -185,6 +185,17 @@ def test_violations_are_capped():
     assert result["violations_truncated"] == 15
 
 
+def test_violation_text_built_from_argument_keys_is_clipped():
+    schema = {"type": "object", "properties": {}, "additionalProperties": False}
+    verdict = conformance.check(schema, {"k" * 5000: 1})
+    (violation,) = verdict["violations"]
+    assert violation["unexpected_keys"] == ["k" * 256 + "…"]
+
+    nested = {"type": "object", "additionalProperties": {"type": "integer"}}
+    (violation,) = conformance.check(nested, {"k" * 5000: "x"})["violations"]
+    assert len(violation["path"]) == 257
+
+
 @pytest.fixture
 def listener():
     """A local HTTP server that records every request path it receives."""

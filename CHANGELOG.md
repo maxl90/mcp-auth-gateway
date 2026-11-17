@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-17
+
+Security fixes from the fourth-pass review: forged attribution headers on the
+forwarding routes, three ways one caller could cost the gateway more than a request
+should, and a stricter DPoP `htu`.
+
+### Security
+
+- **A caller could forge the attribution headers on the forwarding routes.** On
+  `/mcp` in single-upstream mode and on the path-routed `/mcp/<name>`, a request's
+  own `X-MCP-Gateway-On-Behalf-Of` and `X-MCP-Gateway-Correlation-Id` were passed to
+  the upstream, so a backend that records them would record whoever the caller
+  named. Every `X-MCP-Gateway-*` request header now stops at the gateway. The
+  aggregated `/mcp` route was not affected: it builds its upstream requests itself.
+- **A large SQL argument could stall the gateway.** The audit record's structural
+  description parsed the `sql` argument of an `execute_sql` call on the event loop,
+  for a denied call too, at seconds per megabyte. SQL longer than 64 KiB is no
+  longer parsed; its record says `{"kind": "sql", "too_large": true}`.
+- **One request could write an audit record as large as itself.** The tool name
+  and the argument keys of a call, which the caller chooses, were recorded in full.
+  A record's `tool` is now cut to 256 characters and its `reason` to 1024, argument
+  keys to 256 characters each and the first 100 of them (`arg_keys_truncated`
+  counts the rest), and a conformance violation's `path` and `unexpected_keys` to
+  256 characters. A cut value ends in `…`.
+- **The quickstart published an unauthenticated gateway on every interface.**
+  `docker-compose.quickstart.yml` runs with `AUTH_ENABLED=false`; its port is now
+  bound to `127.0.0.1`.
+- **The per-caller cap now covers the aggregated `/mcp` route.** The 16 requests
+  a caller may have in flight applied only to the forwarding routes, but an
+  aggregated call waits up to five minutes on the same connection pool. Requests
+  on both now count against one cap; past it the answer is a 429.
+- **A DPoP proof must name the configured public URL.** With
+  `GATEWAY_EXTERNAL_BASE_URL` set, a proof's `htu` was also accepted when it matched
+  the URL built from the request's `Host`, which the sender chooses. Now only the
+  configured URL is accepted; without one, the URL as the gateway saw it still is.
+  A client that reaches a gateway directly, by an address other than its
+  configured public one, has its proofs refused.
+
+### Changed
+
+- CI actions are pinned by commit instead of by tag.
+- `.dockerignore` keeps local state and secrets (env files, generated policies,
+  the token cache, the audit log, the test PKI) out of the build context. None of
+  them was ever copied into an image.
+- `infra/provision-entra.ps1` generates test-user passwords with the system's
+  cryptographic random generator.
+
 ## [0.3.2] - 2026-10-23
 
 Security fixes: four from the third-pass review, and two MCP spec requirements the
